@@ -6,6 +6,13 @@ Phase 1 设计文档。v2（采纳 GPT 全部 13 条反馈）。
 
 ## 变更历史
 
+- **v4 (2026-09-16)**: Astra 回复 dedupe_key 改成内部 raw_id 绑定
+  - `dedupe_key` 格式：`assistant:{session_id}:{trigger_raw_id}`（原：`llm:{session_id}:{trigger_user_message_id}:assistant`）
+  - `recent_messages` 新增 `trigger_raw_id INTEGER NULL` 字段
+  - 用户消息 trigger_raw_id=NULL；Astra 回复 trigger_raw_id=触发它的用户 raw.id
+  - on_llm_response 里通过 `find_raw_by_platform_msg(session_id, platform_message_id)` 反查
+  - 反查不到时 V1 warning + skip，不生成不稳定 fallback key
+  - 平台 message_id 只负责"定位原消息"，内部关系统一走 raw_id
 - **v3 (2026-09-16)**: 版本号纠正 + 注入方式改回 v4 官方 API
   - AstrBot 分支纠正为 **v4.27.5**（Celii 实际运行版本，v3.5.x 是并行老分支）
   - 注入方式改回 GPT 推荐的 `req.extra_user_content_parts.append(TextPart(text=...).mark_as_temp())`
@@ -168,17 +175,26 @@ CREATE TABLE recent_messages (
     role                TEXT NOT NULL,              -- user / assistant
     content             TEXT NOT NULL,
     reply_to_id         TEXT,                       -- 引用回复的 platform_message_id
+    trigger_raw_id      INTEGER,                    -- Astra 回复的触发 raw_id；用户消息为 NULL
     created_at          INTEGER NOT NULL,           -- unix ts
     processed_at        INTEGER                     -- NULL = 未消化
 );
 CREATE INDEX idx_rm_session_time ON recent_messages(session_id, created_at);
 CREATE INDEX idx_rm_unprocessed ON recent_messages(processed_at, session_id) WHERE processed_at IS NULL;
+CREATE INDEX idx_rm_platform_msg ON recent_messages(session_id, platform_message_id) WHERE platform_message_id IS NOT NULL;
 ```
 
 **dedupe_key 生成规则**：
-- 用户消息：`qq:{session_id}:{platform_message_id}:user`
-- Astra 回复：`llm:{session_id}:{trigger_user_message_id}:assistant`
-  （trigger_user_message_id = 本轮触发 LLM 的用户消息 platform_message_id）
+- 用户消息：`user:{session_id}:{platform_message_id}`
+- Astra 回复：`assistant:{session_id}:{trigger_raw_id}`
+  （trigger_raw_id = 触发本次 LLM 的用户消息在 recent_messages 里的自增 id）
+
+Astra 回复的 trigger_raw_id 通过 `find_raw_by_platform_msg(session_id, platform_message_id)` 反查——on_llm_response hook 里根据 `event` 拿到"这一轮 LLM 是由哪条 platform msg 触发"的原始 QQ msg_id，用它反查 recent_messages 拿到自增 id。**如果反查不到（用户消息还没入库、插件重启丢状态）→ V1 warning + 跳过该 assistant 写入，不生成不稳定 fallback key**。
+
+好处：
+- 所有内部关系统一走 raw_id，平台 message_id 只负责"定位原消息"
+- 一条 inbound 消息对应最多一条 assistant final reply，UNIQUE 天然保证
+- assistant 行的 `trigger_raw_id` 字段直接指向触发它的用户 raw，事件证据链清晰
 
 用 `INSERT OR IGNORE`，无论 hook 重复触发多少次都不会脏库。
 

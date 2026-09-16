@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS recent_messages (
     role                TEXT NOT NULL,                  -- user / assistant
     content             TEXT NOT NULL,
     reply_to_id         TEXT,                           -- 引用回复的 platform_message_id
+    trigger_raw_id      INTEGER,                        -- Astra 回复的触发消息 raw_id；用户消息为 NULL
     created_at          INTEGER NOT NULL,               -- unix ts
     processed_at        INTEGER                         -- NULL = 未消化
 );
@@ -30,6 +31,11 @@ CREATE INDEX IF NOT EXISTS idx_rm_session_time
 CREATE INDEX IF NOT EXISTS idx_rm_unprocessed
     ON recent_messages(processed_at, session_id)
     WHERE processed_at IS NULL;
+
+-- 供 on_llm_response 反查触发消息用
+CREATE INDEX IF NOT EXISTS idx_rm_platform_msg
+    ON recent_messages(session_id, platform_message_id)
+    WHERE platform_message_id IS NOT NULL;
 
 -- ============================================================
 -- 2. episodes: 事件本体

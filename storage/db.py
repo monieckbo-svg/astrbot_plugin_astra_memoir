@@ -158,27 +158,45 @@ class MemoirDB:
         role: str,
         content: str,
         reply_to_id: str | None,
+        trigger_raw_id: int | None,
         created_at: int,
     ) -> int | None:
         """
         插入一条 raw message，若 dedupe_key 冲突返回 None（幂等）。
         成功返回新行 id。
+
+        trigger_raw_id: Astra 回复的触发消息 raw_id；用户消息传 None。
         """
         cur = self.execute(
             """
             INSERT OR IGNORE INTO recent_messages(
                 dedupe_key, platform, chat_type, session_id, group_id,
                 platform_message_id, speaker_id, speaker_name, role,
-                content, reply_to_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                content, reply_to_id, trigger_raw_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 dedupe_key, platform, chat_type, session_id, group_id,
                 platform_message_id, speaker_id, speaker_name, role,
-                content, reply_to_id, created_at,
+                content, reply_to_id, trigger_raw_id, created_at,
             ),
         )
         return cur.lastrowid if cur.rowcount > 0 else None
+
+    def find_raw_by_platform_msg(
+        self, session_id: str, platform_message_id: str,
+    ) -> sqlite3.Row | None:
+        """
+        供 on_llm_response 反查触发它的用户 raw：
+        输入 session_id + QQ 原始 msg_id，返回对应的 recent_messages 行。
+        找不到返回 None（V1 保守：跳过该 assistant 写入并 warning）。
+        """
+        return self.fetchone(
+            "SELECT * FROM recent_messages "
+            "WHERE session_id = ? AND platform_message_id = ? AND role = 'user' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (session_id, platform_message_id),
+        )
 
     def get_unprocessed_by_session(
         self, session_id: str, limit: int | None = None
