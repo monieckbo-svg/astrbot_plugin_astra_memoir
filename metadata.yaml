@@ -1,0 +1,5 @@
+name: astrbot_plugin_astra_memoir
+desc: 星星的自动记忆库 - 私聊/群聊事件消化，SQLite + sqlite-vec
+version: 0.1.0
+author: Astra & Celii
+repo: https://github.com/monieckbo-svg/astrbot_plugin_astra_memoir

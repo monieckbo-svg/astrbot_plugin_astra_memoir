@@ -1,0 +1,77 @@
+{
+  "extract_provider_id": {
+    "description": "事件拆分用的 LLM provider ID（先在 AstrBot 的 provider 设置里配好一个便宜快的模型如 DeepSeek Flash，再把 ID 填这里）。留空则用当前默认 provider（不推荐，会跟星星对话抢配额）",
+    "type": "string",
+    "default": ""
+  },
+  "embedding_provider_id": {
+    "description": "Embedding provider ID（如 BAAI/bge-large-zh-v1.5）。留空则用第一个可用的 embedding provider",
+    "type": "string",
+    "default": ""
+  },
+  "bot_qq_id": {
+    "description": "星星在 QQ 里的 QQ 号（作为 participants 里的稳定身份主键，避免和真人混）",
+    "type": "string",
+    "default": ""
+  },
+  "bot_display_name": {
+    "description": "星星在记忆里的显示名",
+    "type": "string",
+    "default": "星星"
+  },
+  "private_batch_pairs": {
+    "description": "私聊多少轮问答触发一次事件消化",
+    "type": "int",
+    "default": 10
+  },
+  "private_idle_minutes": {
+    "description": "私聊多少分钟没新消息就自动 flush（即使没达到轮数）",
+    "type": "int",
+    "default": 30
+  },
+  "group_batch_messages": {
+    "description": "群聊累计多少条消息触发一次事件消化",
+    "type": "int",
+    "default": 20
+  },
+  "group_idle_minutes": {
+    "description": "群聊多少分钟没新消息就自动 flush",
+    "type": "int",
+    "default": 15
+  },
+  "overlap_group_messages": {
+    "description": "群聊事件消化时附带上一批最后 N 条作为上下文（不产生新事件，只帮理解）",
+    "type": "int",
+    "default": 4
+  },
+  "overlap_private_messages": {
+    "description": "私聊事件消化时附带上一批最后 N 条作为上下文",
+    "type": "int",
+    "default": 2
+  },
+  "raw_retention_days": {
+    "description": "近期原文保留天数。过期后原文删除，episode 保留",
+    "type": "int",
+    "default": 30
+  },
+  "retrieval_top_k": {
+    "description": "每次注入给星星的记忆条数上限",
+    "type": "int",
+    "default": 4
+  },
+  "enable_group_recall_in_private": {
+    "description": "私聊时能否召回群聊事件（默认开）。群聊召回私聊永远关闭，防止群里泄漏隐私",
+    "type": "bool",
+    "default": true
+  },
+  "embedding_dim": {
+    "description": "Embedding 向量维度（bge-large-zh-v1.5 是 1024，改模型时才需改）",
+    "type": "int",
+    "default": 1024
+  },
+  "scheduler_interval_seconds": {
+    "description": "后台调度器多少秒扫一次会话（判断是否 idle flush）",
+    "type": "int",
+    "default": 60
+  }
+}
