@@ -69,6 +69,17 @@ def _mock_astrbot():
     class LLMResponse: pass
     core_provider_entities.LLMResponse = LLMResponse
 
+    core_agent = types.ModuleType("astrbot.core.agent")
+    core_agent_message = types.ModuleType("astrbot.core.agent.message")
+    class TextPart:
+        def __init__(self, text: str):
+            self.text = text
+            self._no_save = False
+        def mark_as_temp(self):
+            self._no_save = True
+            return self
+    core_agent_message.TextPart = TextPart
+
     sys.modules["astrbot"] = api
     sys.modules["astrbot.api"] = api_api
     sys.modules["astrbot.api.event"] = api_event
@@ -77,6 +88,8 @@ def _mock_astrbot():
     sys.modules["astrbot.core"] = core
     sys.modules["astrbot.core.provider"] = core_provider
     sys.modules["astrbot.core.provider.entities"] = core_provider_entities
+    sys.modules["astrbot.core.agent"] = core_agent
+    sys.modules["astrbot.core.agent.message"] = core_agent_message
 
 _mock_astrbot()
 

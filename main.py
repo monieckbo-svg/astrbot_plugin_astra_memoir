@@ -25,6 +25,8 @@ from .pipeline import (
     EpisodeWriter,
     BatchScheduler,
     SchedulerConfig,
+    Retriever,
+    RetrieverConfig,
 )
 
 
@@ -60,6 +62,14 @@ class AstraMemoir(Star):
             raw_retention_days=int(self._cfg("raw_retention_days", 30)),
         )
 
+        retr_cfg = RetrieverConfig(
+            top_k=int(self._cfg("retrieval_top_k", 4)),
+            max_cosine_distance=float(self._cfg("retrieval_max_cosine_distance", 0.9)),
+            enable_group_recall_in_private=bool(
+                self._cfg("enable_group_recall_in_private", True)
+            ),
+        )
+
         # ---- 初始化 DB ----
         data_dir = StarTools.get_data_dir(PLUGIN_NAME)
         db_path = data_dir / "memoir.db"
@@ -74,13 +84,18 @@ class AstraMemoir(Star):
         self.extractor = EventExtractor(context, self.db, extract_provider_id)
         self.writer = EpisodeWriter(context, self.db, self.vec, embedding_provider_id)
         self.scheduler = BatchScheduler(self.db, self.extractor, self.writer, sched_cfg)
+        self.retriever = Retriever(
+            context, self.db, self.vec, retr_cfg, embedding_provider_id
+        )
 
         # ---- 起后台调度 ----
         self.scheduler.start()
 
         logger.info(
-            "[Memoir] 插件加载完成 (embedding_dim=%d, extract_provider=%r)",
+            "[Memoir] 插件加载完成 (embedding_dim=%d, extract_provider=%r, "
+            "top_k=%d, max_cosine_distance=%.2f)",
             embedding_dim, extract_provider_id or "(using_provider)",
+            retr_cfg.top_k, retr_cfg.max_cosine_distance,
         )
 
     def _cfg(self, key: str, default):
@@ -115,11 +130,11 @@ class AstraMemoir(Star):
     @filter.on_llm_request()
     async def on_before_llm(self, event: AstrMessageEvent, req):
         """
-        Phase 1e 待实现：检索相关记忆并注入 req.extra_user_content_parts。
-        目前是 stub。
+        LLM 请求前检索相关记忆并注入。
+        用 req.extra_user_content_parts + mark_as_temp（v4 官方姿势），
+        不动 system_prompt / prompt / contexts，保护 prompt cache。
         """
-        # TODO Phase 1e: retriever.inject(event, req)
-        pass
+        await self.retriever.inject(event, req)
 
     # ==========================================================
     # Lifecycle

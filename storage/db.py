@@ -215,22 +215,47 @@ class MemoirDB:
 
     def get_active_sessions_with_unprocessed(self) -> list[sqlite3.Row]:
         """
-        获取所有"存在未处理消息"的活跃会话，
-        返回每个会话的 session_id、chat_type、最后未处理消息 created_at、未处理消息数。
-        供 scheduler 判断 idle flush 用。
+        获取所有"存在未处理消息"的活跃会话，供 scheduler 判断触发条件。
+
+        返回字段:
+          - session_id, chat_type
+          - last_unprocessed_at: 该会话最后一条未处理消息的时间
+          - unprocessed_count: 未处理消息总数
+          - user_turn_count: 未处理 user 消息数（不管是否已被 Astra 回复）
+          - completed_user_turns: 未处理且【已被 Astra 回复】的 user 消息数
+                （用于私聊数量阈值判定，避免把还没等到回复的最后一条也纳入 batch）
+          - group_inbound_count: 群聊 inbound 消息数（群聊数量阈值用）
+
+        私聊 race 修复:
+          scheduler 判断私聊数量阈值时用 completed_user_turns。
+          idle flush 时用 user_turn_count（允许把长时间没等到回复的孤 user 也消化）。
         """
         return self.fetchall(
             """
             SELECT
-                session_id,
-                MAX(chat_type) AS chat_type,
-                MAX(created_at) AS last_unprocessed_at,
+                rm.session_id,
+                MAX(rm.chat_type) AS chat_type,
+                MAX(rm.created_at) AS last_unprocessed_at,
                 COUNT(*) AS unprocessed_count,
-                SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END) AS user_turn_count,
-                SUM(CASE WHEN role = 'user' AND chat_type = 'group' THEN 1 ELSE 0 END) AS group_inbound_count
-            FROM recent_messages
-            WHERE processed_at IS NULL
-            GROUP BY session_id
+                SUM(CASE WHEN rm.role = 'user' THEN 1 ELSE 0 END) AS user_turn_count,
+                SUM(
+                    CASE
+                        WHEN rm.role = 'user'
+                             AND EXISTS (
+                                SELECT 1 FROM recent_messages a
+                                WHERE a.trigger_raw_id = rm.id
+                                  AND a.role = 'assistant'
+                             )
+                        THEN 1 ELSE 0
+                    END
+                ) AS completed_user_turns,
+                SUM(
+                    CASE WHEN rm.role = 'user' AND rm.chat_type = 'group'
+                    THEN 1 ELSE 0 END
+                ) AS group_inbound_count
+            FROM recent_messages rm
+            WHERE rm.processed_at IS NULL
+            GROUP BY rm.session_id
             """
         )
 

@@ -124,10 +124,14 @@ class BatchScheduler:
             chat_type = row["chat_type"]
             last_at = int(row["last_unprocessed_at"])
             user_turn_count = int(row["user_turn_count"] or 0)
+            completed_user_turns = int(row["completed_user_turns"] or 0)
             group_inbound_count = int(row["group_inbound_count"] or 0)
 
             triggered, reason = self._should_trigger(
-                chat_type, now, last_at, user_turn_count, group_inbound_count
+                chat_type, now, last_at,
+                user_turn_count=user_turn_count,
+                completed_user_turns=completed_user_turns,
+                group_inbound_count=group_inbound_count,
             )
             if triggered:
                 logger.info(
@@ -150,17 +154,33 @@ class BatchScheduler:
         chat_type: str,
         now: int,
         last_at: int,
+        *,
         user_turn_count: int,
+        completed_user_turns: int,
         group_inbound_count: int,
     ) -> tuple[bool, str]:
-        """判断是否达到触发条件。返回 (触发?, 原因)。"""
+        """
+        判断是否达到触发条件。返回 (触发?, 原因)。
+
+        私聊 race 处理:
+          - 数量阈值检查用 completed_user_turns（已被 Astra 回复的 user 数）
+            避免"第 10 条 user 刚到，Astra 还在生成回复" 时把它纳入 batch，
+            导致 assistant reply 后落成孤 raw。
+          - idle 阈值检查用 user_turn_count（含未闭合的）
+            长时间没等到回复（异常/被拦）也允许消化，避免永远卡住。
+        """
         idle_seconds = now - last_at
 
         if chat_type == "private":
-            if user_turn_count >= self.config.private_batch_user_turns:
-                return True, f"private user_turns >= {self.config.private_batch_user_turns}"
+            if completed_user_turns >= self.config.private_batch_user_turns:
+                return True, (
+                    f"private completed_turns >= {self.config.private_batch_user_turns}"
+                )
             if idle_seconds >= self.config.private_idle_minutes * 60:
-                return True, f"private idle {idle_seconds}s"
+                return True, (
+                    f"private idle {idle_seconds}s "
+                    f"(user_turns={user_turn_count}, completed={completed_user_turns})"
+                )
         else:  # group
             if group_inbound_count >= self.config.group_batch_inbound:
                 return True, f"group inbound >= {self.config.group_batch_inbound}"

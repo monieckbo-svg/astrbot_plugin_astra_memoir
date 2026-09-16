@@ -3,6 +3,7 @@ from .raw_cache import RawCache
 from .extractor import EventExtractor, ExtractedEvent
 from .writer import EpisodeWriter
 from .scheduler import BatchScheduler, SchedulerConfig
+from .retriever import Retriever, RetrieverConfig, RecallResult
 
 __all__ = [
     "RawCache",
@@ -11,4 +12,7 @@ __all__ = [
     "EpisodeWriter",
     "BatchScheduler",
     "SchedulerConfig",
+    "Retriever",
+    "RetrieverConfig",
+    "RecallResult",
 ]
