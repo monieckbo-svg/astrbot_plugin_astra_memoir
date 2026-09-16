@@ -1,11 +1,14 @@
 {
   "extract_provider_id": {
-    "description": "事件拆分用的 LLM provider ID（先在 AstrBot 的 provider 设置里配好一个便宜快的模型如 DeepSeek Flash，再把 ID 填这里）。留空则用当前默认 provider（不推荐，会跟星星对话抢配额）",
+    "description": "事件拆分用的 LLM provider",
     "type": "string",
-    "default": ""
+    "default": "",
+    "_special": "select_provider",
+    "hint": "点击右侧按钮从已配置的 provider 里挑一个。强烈建议先建一个便宜快的 provider（如 DeepSeek）专门给记忆用，别用跟星星聊天的主 provider（会抢配额也贵）",
+    "obvious_hint": true
   },
   "embedding_provider_id": {
-    "description": "Embedding provider ID（如 BAAI/bge-large-zh-v1.5）。留空则用第一个可用的 embedding provider",
+    "description": "Embedding provider ID（留空 = 用第一个可用的 embedding provider，正常情况留空就行）",
     "type": "string",
     "default": ""
   },
