@@ -9,28 +9,23 @@
     "type": "string",
     "default": ""
   },
-  "bot_qq_id": {
-    "description": "星星在 QQ 里的 QQ 号（作为 participants 里的稳定身份主键，避免和真人混）",
-    "type": "string",
-    "default": ""
-  },
   "bot_display_name": {
-    "description": "星星在记忆里的显示名",
+    "description": "星星在记忆里的显示名（QQ 号自动通过 event.get_self_id() 获取，不需要手填）",
     "type": "string",
     "default": "星星"
   },
-  "private_batch_pairs": {
-    "description": "私聊多少轮问答触发一次事件消化",
+  "private_batch_user_turns": {
+    "description": "私聊累计多少个新的 user turn 触发一次事件消化（Astra 的回复不算，全部作为上下文一起带上）",
     "type": "int",
     "default": 10
   },
   "private_idle_minutes": {
-    "description": "私聊多少分钟没新消息就自动 flush（即使没达到轮数）",
+    "description": "私聊多少分钟没新消息就自动 flush（即使没达到阈值）",
     "type": "int",
     "default": 30
   },
-  "group_batch_messages": {
-    "description": "群聊累计多少条消息触发一次事件消化",
+  "group_batch_inbound": {
+    "description": "群聊累计多少条 inbound 群友消息触发一次事件消化（Astra 自己的回复不占阈值）",
     "type": "int",
     "default": 20
   },

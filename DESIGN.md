@@ -1,6 +1,26 @@
 # DESIGN — astrbot_plugin_astra_memoir
 
-Phase 1 设计文档。开工前给 Celii 和 GPT 审阅用。
+Phase 1 设计文档。v2（采纳 GPT 全部 13 条反馈）。
+
+---
+
+## 变更历史
+
+- **v2 (2026-09-16)**: 采纳 GPT 反馈：
+  - hook 结论按 AstrBot **v3.5.24**（当前 GitHub 最新 tag）源码确认
+  - 记忆注入改用 `req.prompt` 前置，禁止污染 `system_prompt`（保护 prompt cache）
+  - FTS5 改普通表 + 手工同步（去掉 external-content 的 schema bug）
+  - sqlite-vec 显式 `distance_metric=cosine`
+  - `source_message_ids` → `source_raw_ids`（用 `recent_messages.id` 做证据主键）
+  - `recent_messages` 加 `dedupe_key UNIQUE` 保证幂等
+  - 触发阈值语义化：私聊 10 个 user turn，群聊 20 条 inbound
+  - `bot_qq_id` 删掉，改用 `event.get_self_id()`
+  - DB 固定 `data/plugin_data/{plugin_name}/`
+  - episode 时间字段拆成 `event_start_at / event_end_at / extracted_at`
+  - 混合召回改 RRF（Reciprocal Rank Fusion）
+  - 检索 query 用 `event.message_str`（不用被改写的 `req.prompt`）
+  - `process_batch` 加 per-session lock；events=[] 也标 processed
+- v1: 初版
 
 ---
 
@@ -13,41 +33,50 @@ QQ 消息（私聊 + 群聊）
         └─ Astra 回复 → on_llm_response hook
                 │
                 ▼
-        SQLite: recent_messages
+        SQLite: recent_messages（幂等，dedupe_key UNIQUE）
                 │
         ┌───────┴───────┐
         │               │
-    达到阈值         idle timeout
-    私聊 10 轮       私聊 30 分钟
-    群聊 20 条       群聊 15 分钟
+    数量阈值         idle timeout
+    私聊 10 user     私聊 30 分钟
+    群聊 20 inbound  群聊 15 分钟
         │               │
         └───────┬───────┘
                 ▼
-        process_batch(session_id)
+    process_batch(session_id)  [per-session lock]
                 │
                 ▼
-        LLM 事件拆分（DeepSeek Flash / 用户配的 provider）
-        JSON 输出，events=[] 也是合法结果
+    LLM 事件拆分（用户配的 provider）
+    JSON 输出，events=[] 合法
                 │
                 ▼
-        SQLite: episodes + episode_participants + episode_keywords
+    SQLite: episodes + episode_participants + episode_keywords + episodes_fts
                 │
                 ▼
-        Embedding (BAAI/bge-large-zh-v1.5 / 用户配的 provider)
+    Embedding（用户配的 embedding provider）
                 │
                 ▼
-        sqlite-vec: episode_embeddings
+    sqlite-vec: episode_vec (distance_metric=cosine)
+                │
+                ▼
+    全部成功 → recent_messages 批量标 processed
+    events=[] → 同样标 processed（防止死循环重跑）
                 │
                 │  ── 新消息到来 ──
                 ▼
-        向量 + FTS5 混合召回 → top 3~5 → 临时注入 Astra
+    on_llm_request hook: 用 event.message_str 做检索 query
+    向量 KNN + FTS5 → RRF 融合 + participant/recency 加分 → top 3~5
+                │
+                ▼
+    req.prompt = f"[相关记忆]\n{memory}\n[/相关记忆]\n\n{req.prompt}"
+    system_prompt 保持不动，保护 prompt cache
 ```
 
 ---
 
 ## 2. Hook 挂载点
 
-已读 AstrBot 3.5.24 源码确认。
+已读 AstrBot **v3.5.24** 源码确认（当前 GitHub 最新 tag，Celii 服务器版本待确认）。
 
 ### 2.1 用户消息入库
 ```python
@@ -55,101 +84,134 @@ QQ 消息（私聊 + 群聊）
 async def on_user_message(self, event: AstrMessageEvent):
     # 落 raw cache
 ```
-- **能抓群聊里所有人的消息**（包括未 @Astra 的），这是 Celii 明确要求
-- 群聊 speaker_id 用 `event.get_sender_id()`（QQ 号，稳定主键）
-- speaker_name 用 `event.get_sender_name()`（当时昵称快照）
+- 抓群聊里所有人的消息（包括未 @Astra 的），Celii 明确要求
+- speaker_id = `event.get_sender_id()`（QQ 号，稳定身份主键）
+- speaker_name = `event.get_sender_name()`（当时昵称快照）
+- platform_message_id = 从 event 里取
 
 ### 2.2 Astra 回复入库
 
-**用 `on_llm_response` 而不是 `on_decorating_result` / `after_message_sent`**：
+**用 `on_llm_response`**：
 
-| Hook | 时机 | 问题 |
+| Hook | 时机 | 评估 |
 |------|------|------|
-| `on_llm_response` | LLM 生成后，工具调用完毕后的最终 completion | ✅ 干净、一次触发、拿到完整原文 |
-| `on_decorating_result` | 结果装饰阶段 | ❌ splitter 插件在这里切碎 chain，可能拿到碎片 |
-| `after_message_sent` | 发送完成后 | ❌ chain 可能已被切分；且如果发送失败也会导致漏抓 |
+| `on_llm_response` | LLM 生成后、工具调用完毕后的最终 completion | ✅ 一次对话一次触发，拿到完整原文 |
+| `on_decorating_result` | 结果装饰阶段 | ❌ splitter 在这里切碎 chain |
+| `after_message_sent` | 发送完成后 | ❌ chain 已被切分；发送失败会漏抓 |
 
 源码确认（`tool_loop_agent.py:123-131`）：
 ```python
 if not llm_resp.tools_call_name:
-    # 没有工具调用时才触发 OnLLMResponseEvent —— 这就是最终响应
+    # 只在无工具调用（最终响应）时触发
     await self.pipeline_ctx.call_event_hook(
         self.event, EventType.OnLLMResponseEvent, llm_resp
     )
 ```
-中间的 tool_use 步骤**不会**触发，正是我们要的"一次对话一次落库"。
 
 ```python
 @filter.on_llm_response()
 async def on_astra_reply(self, event: AstrMessageEvent, resp: LLMResponse):
     text = resp.completion_text
-    # 落 raw cache，role=assistant，speaker_id=BOT_QQ_ID
+    # speaker_id = event.get_self_id()  ← Astra 自己的 QQ 号，自动获取
+    # role=assistant
+    # platform_message_id = None  ← 此时消息还没发出，QQ msg_id 不存在
 ```
 
-### 2.3 assistant 的 speaker_id
-- **不用 "assistant" 字符串冒充**
-- 从 config 读一个 `bot_qq_id`（Celii 配置里填），作为 Astra 在 QQ 里的身份主键
-- speaker_name 用 config 里的 `bot_display_name`（默认 "星星"）
+### 2.3 Astra 的 speaker_id
+- **不用 "assistant" 字符串**
+- **不需要用户手填** bot_qq_id
+- 直接 `event.get_self_id()` 拿 bot 自己的 QQ 号，作为 participants 里的稳定身份主键
+- speaker_name = 配置的 `bot_display_name`（默认 "星星"）
+
+### 2.4 记忆检索与注入
+```python
+@filter.on_llm_request()
+async def on_before_llm(self, event: AstrMessageEvent, req: ProviderRequest):
+    # 用 event.message_str 做检索 query（不用 req.prompt，
+    # 避免被群聊上下文插件等改写、召回被稀释）
+    query = event.message_str
+    memories = await retriever.recall(session_id, chat_type, query, speaker_id)
+    if memories:
+        # 前置到 prompt，不动 system_prompt，保护 prompt cache
+        req.prompt = f"[相关记忆]\n{memories}\n[/相关记忆]\n\n{req.prompt}"
+```
+
+**关键**：v3.5.24 的 `ProviderRequest` 只有 `prompt / system_prompt / contexts / image_urls`，没有 `extra_user_content_parts` 或 `mark_as_temp()` 接口。等价做法是前置到 `req.prompt`——system_prompt 保持稳定（cache 不破），记忆随 prompt 每轮变化。
 
 ---
 
 ## 3. SQLite Schema
 
-主库 `memoir.db`，三张核心表 + FTS5 + sqlite-vec。
+DB 路径：**`data/plugin_data/astrbot_plugin_astra_memoir/memoir.db`**（AstrBot 官方推荐插件持久数据位置，插件升级不受影响）。
 
-### 3.1 recent_messages（近期原文缓存）
+### 3.1 recent_messages（近期原文缓存，幂等）
 ```sql
 CREATE TABLE recent_messages (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    platform        TEXT NOT NULL DEFAULT 'qq',      -- 预留：qq / discord
-    chat_type       TEXT NOT NULL,                    -- private / group
-    session_id      TEXT NOT NULL,                    -- unified_message_origin
-    group_id        TEXT,                             -- 群号，私聊为 NULL
-    message_id      TEXT,                             -- QQ 原始 msg_id
-    speaker_id      TEXT NOT NULL,                    -- QQ 号（bot 也用 QQ 号，不用 'assistant'）
-    speaker_name    TEXT NOT NULL,                    -- 当时昵称快照
-    role            TEXT NOT NULL,                    -- user / assistant
-    content         TEXT NOT NULL,
-    reply_to_id     TEXT,                             -- 引用回复的 msg_id
-    created_at      INTEGER NOT NULL,                 -- unix ts
-    processed_at    INTEGER                           -- NULL 表示未消化
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    dedupe_key          TEXT NOT NULL UNIQUE,       -- 幂等键，防重复写入
+    platform            TEXT NOT NULL DEFAULT 'qq', -- qq / discord（预留）
+    chat_type           TEXT NOT NULL,              -- private / group
+    session_id          TEXT NOT NULL,              -- unified_message_origin
+    group_id            TEXT,                       -- 群号，私聊为 NULL
+    platform_message_id TEXT,                       -- QQ 原始 msg_id（assistant 可为 NULL）
+    speaker_id          TEXT NOT NULL,              -- QQ 号（bot 自己也用 QQ 号）
+    speaker_name        TEXT NOT NULL,              -- 当时昵称快照
+    role                TEXT NOT NULL,              -- user / assistant
+    content             TEXT NOT NULL,
+    reply_to_id         TEXT,                       -- 引用回复的 platform_message_id
+    created_at          INTEGER NOT NULL,           -- unix ts
+    processed_at        INTEGER                     -- NULL = 未消化
 );
 CREATE INDEX idx_rm_session_time ON recent_messages(session_id, created_at);
-CREATE INDEX idx_rm_unprocessed ON recent_messages(processed_at) WHERE processed_at IS NULL;
+CREATE INDEX idx_rm_unprocessed ON recent_messages(processed_at, session_id) WHERE processed_at IS NULL;
 ```
+
+**dedupe_key 生成规则**：
+- 用户消息：`qq:{session_id}:{platform_message_id}:user`
+- Astra 回复：`llm:{session_id}:{trigger_user_message_id}:assistant`
+  （trigger_user_message_id = 本轮触发 LLM 的用户消息 platform_message_id）
+
+用 `INSERT OR IGNORE`，无论 hook 重复触发多少次都不会脏库。
 
 ### 3.2 episodes（事件本体）
 ```sql
 CREATE TABLE episodes (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    platform        TEXT NOT NULL DEFAULT 'qq',
-    chat_type       TEXT NOT NULL,                    -- private / group
-    session_id      TEXT NOT NULL,
-    group_id        TEXT,
-    title           TEXT NOT NULL,
-    content         TEXT NOT NULL,                    -- 纯正文，没有 <MNEMO_META>
-    source_message_ids TEXT NOT NULL,                 -- JSON array
-    created_at      INTEGER NOT NULL,
-    last_accessed_at INTEGER
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform            TEXT NOT NULL DEFAULT 'qq',
+    chat_type           TEXT NOT NULL,              -- private / group
+    session_id          TEXT NOT NULL,
+    group_id            TEXT,
+    title               TEXT NOT NULL,
+    content             TEXT NOT NULL,              -- 纯正文，不带 <MNEMO_META>
+    source_raw_ids      TEXT NOT NULL,              -- JSON array of recent_messages.id
+    event_start_at      INTEGER NOT NULL,           -- source raw 最早 created_at
+    event_end_at        INTEGER NOT NULL,           -- source raw 最晚 created_at
+    extracted_at        INTEGER NOT NULL,           -- 模型完成提取的时间
+    last_accessed_at    INTEGER
 );
-CREATE INDEX idx_ep_session_time ON episodes(session_id, created_at);
+CREATE INDEX idx_ep_session_time ON episodes(session_id, event_end_at);
 CREATE INDEX idx_ep_chat_type ON episodes(chat_type);
+CREATE INDEX idx_ep_group ON episodes(group_id);
 ```
 
-### 3.3 episode_participants（参与者，由代码回查而非 LLM 生成）
+**关键变化**：
+- `source_message_ids` → **`source_raw_ids`**：统一用 `recent_messages.id`（SQLite 自增），因为 Astra 回复在 on_llm_response 阶段还没有 QQ msg_id
+- 时间字段拆成三个：**event_start_at / event_end_at** 是聊天实际发生时间（来自 source raw），**extracted_at** 才是模型提取完成时间。"上午 10 点聊的那个" 用 event_start_at 检索
+
+### 3.3 episode_participants
 ```sql
 CREATE TABLE episode_participants (
     episode_id      INTEGER NOT NULL,
-    speaker_id      TEXT NOT NULL,                    -- QQ 号，身份主键
-    speaker_name    TEXT NOT NULL,                    -- 当时昵称快照
-    role            TEXT NOT NULL,                    -- user / assistant
+    speaker_id      TEXT NOT NULL,      -- QQ 号，身份主键
+    speaker_name    TEXT NOT NULL,      -- 当时昵称快照
+    role            TEXT NOT NULL,      -- user / assistant
     PRIMARY KEY (episode_id, speaker_id),
     FOREIGN KEY (episode_id) REFERENCES episodes(id) ON DELETE CASCADE
 );
 CREATE INDEX idx_ep_part_speaker ON episode_participants(speaker_id);
 ```
 
-**防串号关键**：participants 由 `source_message_ids` → `recent_messages` 回查算出，**LLM 输出的 participants 一律忽略**。QQ 号是主键，昵称改了不会变成另一个人。Astra 参与时她的 QQ 号（config 里的 bot_qq_id）也进 participants。
+**防串号关键**：participants 由 `source_raw_ids` → `recent_messages` 回查算出，**LLM 输出的 participants 一律忽略**。
 
 ### 3.4 episode_keywords
 ```sql
@@ -161,48 +223,67 @@ CREATE TABLE episode_keywords (
 );
 ```
 
-### 3.5 FTS5 全文索引
+### 3.5 FTS5 全文索引（普通表，手工同步）
 ```sql
+-- 不用 external-content，避免 schema 依赖 episodes 表里不存在的 keywords 列
 CREATE VIRTUAL TABLE episodes_fts USING fts5(
-    title, content, keywords,
-    content='episodes',
-    content_rowid='id',
+    title,
+    content,
+    keywords,               -- 用空格拼接的关键词字符串
     tokenize='unicode61'
 );
 ```
+
+写 episode 时同步插入：
+```python
+db.execute(
+    "INSERT INTO episodes_fts(rowid, title, content, keywords) VALUES (?, ?, ?, ?)",
+    (episode_id, title, content, " ".join(keywords))
+)
+```
+
+几万条规模多存这点文本无所谓，逻辑简单可靠。
 
 ### 3.6 sqlite-vec 向量索引
 ```sql
 CREATE VIRTUAL TABLE episode_vec USING vec0(
     episode_id INTEGER PRIMARY KEY,
-    embedding FLOAT[1024]              -- bge-large-zh-v1.5 是 1024 维
+    embedding FLOAT[1024] distance_metric=cosine    -- 显式 cosine，不用默认 L2
 );
 ```
 
+sqlite-vec KNN 返回 `distance`（越小越近）。代码统一用 **`cosine_distance`** 语义：
+- 相似度阈值："distance < 0.04"（约等于 similarity > 0.96）
+- 不在代码里混用 similarity 和 distance
+
 **为什么 sqlite-vec 而不是 Milvus**：
-- 一个 `.db` 文件搞定，不需要单独跑 Docker 容器
-- Celii 服务器 2G 内存紧张，Milvus 光启动就吃几百 MB
-- 群十几个人 + 私聊的规模，一年最多几万条 episode，sqlite-vec 完全够用
-- 换 embedding 模型时只需 DROP TABLE + 重建，比 Milvus 简单
+- 一个 `.db` 文件搞定，不需要单独 Docker
+- Celii 服务器内存紧张
+- 规模一年最多几万 episode，sqlite-vec 足够
+- 换 embedding 模型只需 DROP + 重建
 
 ---
 
 ## 4. 触发时机
 
-统一 scheduler，每 60 秒扫一次"有未处理消息的活跃会话"（查 `recent_messages` 的 `processed_at IS NULL` 视图）。
+统一 scheduler，每 60 秒扫一次"有未处理消息的活跃会话"。
 
 | 场景 | 数量阈值 | idle 阈值 |
 |------|----------|-----------|
-| 私聊 | 10 轮（20 条 user+assistant） | 30 分钟无新消息 |
-| 群聊 | 20 条 | 15 分钟无新消息 |
+| 私聊 | **10 个新 user turn**（assistant 行不算，全部作为上下文一起带上） | 30 分钟 |
+| 群聊 | **20 条 inbound 群友消息**（Astra 自己回复不占阈值） | 15 分钟 |
 
-任一先满足即触发 `process_batch(session_id)`。**两个触发走同一入口**，禁止两套代码。
+任一先满足即触发 `process_batch(session_id)`。**per-session lock**，同一会话同时只跑一次；两个触发条件走同一入口。
+
+**语义清晰**：
+- 私聊：你连续发两句 Astra 才回一句，或某条被拦掉没 LLM 回复——都不会导致阈值误判
+- 群聊：Astra 参与与否不影响群消息计数
 
 ---
 
 ## 5. 事件拆分 Prompt
 
-调用 `context.get_provider_by_id(config.extract_provider_id).text_chat(...)`，让用户在 config 里指定用哪个 provider。
+调用 `context.get_provider_by_id(config.extract_provider_id).text_chat(...)`。
 
 ### 5.1 私聊 prompt 骨架
 ```
@@ -212,16 +293,16 @@ CREATE VIRTUAL TABLE episode_vec USING vec0(
 每个事件必须能脱离本批次独立理解，保留具体人、物、名称、数字、决定和结果。
 
 【本批对话】
-[msg_id=101] 陆忱: 中午吃了石锅拌饭
-[msg_id=102] 星星: ...
+[raw_id=101] 陆忱: 中午吃了石锅拌饭
+[raw_id=102] 星星: ...
 ...
 
-输出严格 JSON，格式：
+输出严格 JSON：
 {"events":[
   {
     "title": "简短标题",
     "content": "详细内容，能独立理解",
-    "source_message_ids": ["101","102"],
+    "source_raw_ids": [101, 102],
     "keywords": ["石锅拌饭","午饭"]
   }
 ]}
@@ -229,116 +310,124 @@ CREATE VIRTUAL TABLE episode_vec USING vec0(
 ```
 
 ### 5.2 群聊 prompt 骨架
-相同结构，但输入格式强调 speaker：
+输入格式强调 speaker（QQ 号由代码从 event 对象取）：
 ```
-[msg_id=8871][qq=111111][name=小雨] 我昨天已经把那个插件重装了
-[msg_id=8872][qq=222222][name=温局] 我这边重装以后还是报错
+[raw_id=8871][qq=111111][name=小雨] 我昨天已经把那个插件重装了
+[raw_id=8872][qq=222222][name=温局] 我这边重装以后还是报错
 ```
-
-**speaker_id 由代码从 event 对象取，绝不让 LLM 从昵称或正文猜。**
 
 ### 5.3 Overlap（跨批次上下文）
-群聊每批附带**上一批最后 4 条**作为 `<context_only>`，私聊附带 **2 条**。硬规则：
-> 每个输出 episode 至少必须引用一个 new_messages 的 msg_id。
+群聊每批附带**上一批最后 4 条**作为 `<context_only>`，私聊 **2 条**。硬规则：
+> 每个输出 episode 至少必须引用一个 new_messages 的 raw_id。
 
-代码在事件写入前校验 `source_message_ids` 至少含一个本批新增 ID，否则丢弃该事件。这样旧消息不会被重复消化。
+代码在事件写入前校验，不满足的事件直接丢弃。旧消息只帮理解上下文，不会被重复消化。
+
+### 5.4 幂等约束
+- `process_batch` 加 **per-session asyncio.Lock**
+- 所有落库（episodes / participants / keywords / FTS / vec）在**单个 transaction** 里完成
+- **全部成功**才把 recent_messages 批量标 `processed_at`
+- **events=[]** 也标 processed（无有效事件是合法结果，不能死循环重跑）
+- 任一步失败：raw 保持 unprocessed，下次调度再试
 
 ---
 
 ## 6. 检索与注入
 
 ### 6.1 触发时机
-每次收到用户消息、进入 LLM 请求前（`on_llm_request` hook），做一次检索并注入 system_prompt。
+`on_llm_request` hook，用 **`event.message_str`** 做检索 query（不用 `req.prompt`，因为可能已被群聊上下文插件改写、导致召回被稀释）。
 
-### 6.2 混合召回
-- **向量召回**: sqlite-vec `MATCH` top 10
-- **关键词召回**: FTS5 `MATCH` top 10
-- **合并 + 重排**:
-  - 语义相似度 (0-1)
-  - FTS5 命中加 +0.2
-  - **当前 speaker 参与过 → +0.15**（不做硬过滤，只加分）
-  - 时间衰减：`exp(-days/30) * 0.1`
-- 取 top 3~5 注入
+### 6.2 混合召回（RRF）
+**BM25 分数与 cosine distance 不同量纲，不能直接相加。用 RRF 融合**：
+
+```python
+# 向量召回 top 20
+vec_hits = sqlite_vec_knn(query_embedding, k=20)  # [(episode_id, distance), ...]
+
+# FTS5 召回 top 20
+fts_hits = fts5_search(query, k=20)  # [episode_id, ...]
+
+# RRF (k=60 是文献推荐值)
+scores = {}
+for rank, (eid, _) in enumerate(vec_hits):
+    scores[eid] = scores.get(eid, 0) + 1 / (60 + rank)
+for rank, eid in enumerate(fts_hits):
+    scores[eid] = scores.get(eid, 0) + 1 / (60 + rank)
+
+# 加分（都不做硬过滤）
+for eid in scores:
+    if current_speaker in participants[eid]:
+        scores[eid] += 0.02  # participant bonus
+    days_ago = (now - event_end_at[eid]) / 86400
+    scores[eid] += 0.01 * exp(-days_ago / 30)  # recency
+
+# 取 top_k
+```
 
 ### 6.3 私聊 / 群聊边界（信息可见性）
 - **陆忱 ↔ Astra 私聊时**：召回范围 = 当前私聊 episode ∪ **所有 QQ 群聊 episode**
-  - 所以陆忱能问"上午群里那个插件后来怎么了"
+  - 所以能问 "上午群里那个插件后来怎么了"
 - **Astra 在群里时**：召回范围 = **仅当前群 episode**
-  - 不自动带出任何私聊内容或其他群内容
-  - 防止群里泄漏私聊隐私
+  - 不带出任何私聊或其他群
+  - 防止群里泄漏隐私
 
-### 6.4 注入格式
-干净、无 metadata：
-```
-[相关记忆]
-1. [2026-09-14 · 群聊 · QQ空间插件更新]
-   陆忱完成图片上传功能，小雨测试通过。
-   参与者：陆忱、小雨、星星
+### 6.4 注入格式（前置到 req.prompt，不动 system_prompt）
+```python
+memory_text = "\n\n".join([
+    f"[{fmt_date(ep.event_start_at)} · {chat_type_label} · {ep.title}]\n"
+    f"{ep.content}\n"
+    f"参与者：{', '.join(ep.participants)}"
+    for ep in top_episodes
+])
 
-2. [2026-09-15 · 私聊 · 虾仁炒饭]
-   陆忱中午吃了石锅拌饭和奶茶，觉得晚上可能不想再吃。
+req.prompt = f"[相关记忆]\n{memory_text}\n[/相关记忆]\n\n{req.prompt}"
 ```
-不带 embedding score、内部 ID、JSON、关系图。
+
+**不带**：embedding score、内部 ID、JSON、关系图。
 
 ---
 
 ## 7. TTL 与清理
 
 后台任务每天扫一次 `recent_messages`：
-- 已 `processed_at` 且 `created_at < now - retention_days` → 删除
-- 未处理的消息永不删（保护未消化数据）
+- 已 processed 且 `created_at < now - retention_days` → 删除
+- 未处理的永不删（保护未消化数据）
 
-默认 `retention_days = 30`。
-
-episode 永久保留（Phase 1 不做衰减）。
+默认 `retention_days = 30`。episode 永久保留（Phase 1 不做衰减）。
 
 ---
 
-## 8. 重复检测（V1 简化版）
+## 8. 重复检测（V1 简化）
 
-新事件写入前，用 embedding 余弦相似度查最近 3 天内的 episode：
-- 相似度 > 0.96
+新事件写入前，用 embedding 余弦距离查最近 3 天内的 episode：
+- `cosine_distance < 0.04`
 - 且 participants 高度重叠
 - 才判定重复，跳过写入
 
-**不调用 LLM 做重复判断**。误合并比多存一条更难修，V1 宁可多存。
+**不调用 LLM 判断重复**。误合并比多存一条更难修，V1 宁可多存。
 
 ---
 
-## 9. Config Schema（用户填什么）
+## 9. Config Schema
+
+（详见仓库 `_conf_schema.json`）
 
 ```jsonc
 {
-  "extract_provider_id": {
-    "description": "事件拆分用哪个 LLM provider（在 AstrBot 里配好，填 provider id）",
-    "type": "string",
-    "default": ""
-  },
-  "embedding_provider_id": {
-    "description": "Embedding 用哪个 provider（在 AstrBot 里配好，留空则用第一个可用的 embedding provider）",
-    "type": "string",
-    "default": ""
-  },
-  "bot_qq_id": {
-    "description": "Astra 的 QQ 号（作为 participants 里的稳定身份主键）",
-    "type": "string",
-    "default": ""
-  },
-  "bot_display_name": {
-    "description": "Astra 在记忆里的显示名",
-    "type": "string",
-    "default": "星星"
-  },
-  "private_batch_pairs": { "type": "int", "default": 10 },
-  "private_idle_minutes": { "type": "int", "default": 30 },
-  "group_batch_messages": { "type": "int", "default": 20 },
-  "group_idle_minutes": { "type": "int", "default": 15 },
-  "overlap_group_messages": { "type": "int", "default": 4 },
-  "overlap_private_messages": { "type": "int", "default": 2 },
-  "raw_retention_days": { "type": "int", "default": 30 },
-  "retrieval_top_k": { "type": "int", "default": 4 },
-  "enable_group_recall_in_private": { "type": "bool", "default": true },
-  "embedding_dim": { "type": "int", "default": 1024 }
+  "extract_provider_id":       "事件拆分用哪个 LLM provider ID",
+  "embedding_provider_id":     "Embedding provider ID（留空用第一个可用）",
+  // "bot_qq_id" 已删除 —— 用 event.get_self_id() 自动获取
+  "bot_display_name":          "星星在记忆里的显示名",
+  "private_batch_user_turns":  10,     // 私聊：10 个 user turn
+  "private_idle_minutes":      30,
+  "group_batch_inbound":       20,     // 群聊：20 条 inbound 群消息
+  "group_idle_minutes":        15,
+  "overlap_group_messages":    4,
+  "overlap_private_messages":  2,
+  "raw_retention_days":        30,
+  "retrieval_top_k":           4,
+  "enable_group_recall_in_private": true,
+  "embedding_dim":             1024,
+  "scheduler_interval_seconds": 60
 }
 ```
 
@@ -351,13 +440,16 @@ episode 永久保留（Phase 1 不做衰减）。
 1. ✅ 中午说"今天吃了虾仁炒饭"，晚上问星星"我今天吃了啥"，能召回
 2. ✅ 上午聊某插件 bug，下午说"那插件后来怎样了"，能召回对应 episode
 3. ✅ 群里小雨说自己感冒，第二天陆忱私聊问"小雨怎么了"，能从群聊 episode 回答
-4. ✅ 同一批群聊同时讨论"插件"和"吃饭"，拆成至少两个独立 episode，不揉成一坨
-5. ✅ 一批只有"哈哈哈哈"、表情、无意义寒暄时，events=[]，不新增 episode
-6. ✅ 群聊跨批次同一件事，overlap 能帮理解，每个 episode 必须引用至少一个新批次 msg_id
+4. ✅ 同一批群聊同时讨论"插件"和"吃饭"，拆成至少两个独立 episode
+5. ✅ 一批只有"哈哈哈哈"、表情、无意义寒暄时，events=[]，不新增 episode，raw 仍标 processed
+6. ✅ 群聊跨批次同一件事，overlap 能帮理解，每个 episode 必须引用至少一个新批次 raw_id
 7. ✅ 群友 A 的事实绝不归到群友 B 名下（QQ ID 由代码回查决定）
-8. ✅ Astra 群里参与时，Astra 出现在 participants
+8. ✅ Astra 群里参与时，Astra 出现在 participants（用 event.get_self_id()）
 9. ✅ 私聊自动召回群聊事件；群聊自动召回不带出任何私聊 episode
 10. ✅ raw message 过期删除后，episode 与检索仍正常
+11. ✅ hook 重复触发（插件 reload / 消息重放）不会脏库（dedupe_key UNIQUE）
+12. ✅ prompt cache 不被破坏（system_prompt 不动，记忆前置到 prompt）
+13. ✅ process_batch 并发触发不会重复消化同一批 raw（per-session lock）
 
 ---
 
@@ -378,13 +470,14 @@ astrbot_plugin_astra_memoir/
 │   └── vec_store.py                 # sqlite-vec 封装
 ├── pipeline/
 │   ├── __init__.py
-│   ├── raw_cache.py                 # 消息入库
-│   ├── scheduler.py                 # idle flush 调度
-│   ├── extractor.py                 # LLM 事件拆分
-│   ├── writer.py                    # episode 落库
-│   └── retriever.py                 # 检索 + 注入
+│   ├── raw_cache.py                 # 消息入库（含 dedupe_key 生成）
+│   ├── scheduler.py                 # 60s 轮询 + per-session lock
+│   ├── extractor.py                 # LLM 事件拆分 + JSON 校验
+│   ├── writer.py                    # episode 落库 + FTS + vec + 幂等
+│   └── retriever.py                 # RRF 检索 + prompt 前置注入
 └── utils/
     ├── __init__.py
+    ├── dedupe.py                    # dedupe_key 生成
     └── logging.py
 ```
 
@@ -396,17 +489,16 @@ astrbot_plugin_astra_memoir/
 sqlite-vec>=0.1.6
 ```
 
-其他全部用 AstrBot 已有的（httpx、pydantic、asyncio 等）。
+其他全部用 AstrBot 已有依赖（httpx、pydantic、asyncio）。
 
 ---
 
 ## 13. 开工顺序
 
-1. ✅ 骨架 + DESIGN.md（本 commit）
-2. schema.sql + storage/db.py + storage/vec_store.py
-3. main.py 挂 hook + pipeline/raw_cache.py（用户消息 & Astra 回复入库）
-4. pipeline/scheduler.py + pipeline/extractor.py + pipeline/writer.py（消化 + 落库）
-5. pipeline/retriever.py（检索 + 注入）
-6. 跑通端到端 + 10 个验收 case
-
-每步一个 commit，Celii 可随时看进度。
+1. ✅ 骨架 + DESIGN v1（commit 1）
+2. ✅ DESIGN v2 采纳 GPT 反馈（本 commit）
+3. schema.sql + storage/db.py + storage/vec_store.py（含 sqlite-vec 加载、cosine 指定、dedupe_key UNIQUE）
+4. main.py 完善 hook + pipeline/raw_cache.py（含 dedupe_key 生成、event.get_self_id()）
+5. pipeline/scheduler.py + pipeline/extractor.py + pipeline/writer.py（per-session lock、events=[] 标 processed、事件校验硬规则）
+6. pipeline/retriever.py（event.message_str 做 query、RRF 融合、prompt 前置注入）
+7. 跑通端到端 + 13 个验收 case
