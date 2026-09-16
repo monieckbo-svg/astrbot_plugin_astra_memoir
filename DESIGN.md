@@ -6,8 +6,12 @@ Phase 1 设计文档。v2（采纳 GPT 全部 13 条反馈）。
 
 ## 变更历史
 
-- **v2 (2026-09-16)**: 采纳 GPT 反馈：
-  - hook 结论按 AstrBot **v3.5.24**（当前 GitHub 最新 tag）源码确认
+- **v3 (2026-09-16)**: 版本号纠正 + 注入方式改回 v4 官方 API
+  - AstrBot 分支纠正为 **v4.27.5**（Celii 实际运行版本，v3.5.x 是并行老分支）
+  - 注入方式改回 GPT 推荐的 `req.extra_user_content_parts.append(TextPart(text=...).mark_as_temp())`
+    —— v4 官方 `group_chat_context` 内置插件就是这个用法，比 prompt 前置更干净：
+    `mark_as_temp()` 明确告诉 AstrBot"只给 provider 看、不进对话历史"
+- **v2 (2026-09-16)**: 采纳 GPT 反馈 13 条（版本号一开始误写为 v3.5.24）
   - 记忆注入改用 `req.prompt` 前置，禁止污染 `system_prompt`（保护 prompt cache）
   - FTS5 改普通表 + 手工同步（去掉 external-content 的 schema bug）
   - sqlite-vec 显式 `distance_metric=cosine`
@@ -68,15 +72,18 @@ QQ 消息（私聊 + 群聊）
     向量 KNN + FTS5 → RRF 融合 + participant/recency 加分 → top 3~5
                 │
                 ▼
-    req.prompt = f"[相关记忆]\n{memory}\n[/相关记忆]\n\n{req.prompt}"
-    system_prompt 保持不动，保护 prompt cache
+    req.extra_user_content_parts.append(
+        TextPart(text=f"[相关记忆]\n{memory}\n[/相关记忆]").mark_as_temp()
+    )
+    system_prompt / prompt / contexts 全部不动，只在本轮 provider 请求追加
+    mark_as_temp() 保证不进对话历史，prompt cache 完好
 ```
 
 ---
 
 ## 2. Hook 挂载点
 
-已读 AstrBot **v3.5.24** 源码确认（当前 GitHub 最新 tag，Celii 服务器版本待确认）。
+已读 AstrBot **v4.27.5** 源码确认（Celii 服务器实际运行版本；v3.5.x 是并行的老分支）。
 
 ### 2.1 用户消息入库
 ```python
@@ -91,22 +98,16 @@ async def on_user_message(self, event: AstrMessageEvent):
 
 ### 2.2 Astra 回复入库
 
-**用 `on_llm_response`**：
+**用 `on_llm_response`**（v4 里也可选 `on_agent_done`，两者在 `astr_agent_hooks.on_agent_done` 里连续触发，语义相近；`on_llm_response` 是历史 API，`on_agent_done` 是 v4 新增更明确的"agent 一轮完成"信号——V1 用 `on_llm_response` 兼容性更好）：
 
 | Hook | 时机 | 评估 |
 |------|------|------|
-| `on_llm_response` | LLM 生成后、工具调用完毕后的最终 completion | ✅ 一次对话一次触发，拿到完整原文 |
+| `on_llm_response` | agent 完成（tool loop 结束、拿到最终 completion）时触发 | ✅ 拿到完整原文 |
+| `on_agent_done` | 同上，v4 新增，语义更明确 | ✅ 也可用 |
 | `on_decorating_result` | 结果装饰阶段 | ❌ splitter 在这里切碎 chain |
 | `after_message_sent` | 发送完成后 | ❌ chain 已被切分；发送失败会漏抓 |
 
-源码确认（`tool_loop_agent.py:123-131`）：
-```python
-if not llm_resp.tools_call_name:
-    # 只在无工具调用（最终响应）时触发
-    await self.pipeline_ctx.call_event_hook(
-        self.event, EventType.OnLLMResponseEvent, llm_resp
-    )
-```
+v4 源码确认（`astrbot/core/astr_agent_hooks.py:32-40`）：`on_llm_response` 与 `on_agent_done` 都在 `agent_hooks.on_agent_done()` 里连续 `call_event_hook`，即 tool loop 结束后的最终响应。
 
 ```python
 @filter.on_llm_response()
@@ -125,18 +126,26 @@ async def on_astra_reply(self, event: AstrMessageEvent, resp: LLMResponse):
 
 ### 2.4 记忆检索与注入
 ```python
+from astrbot.core.agent.message import TextPart
+
 @filter.on_llm_request()
 async def on_before_llm(self, event: AstrMessageEvent, req: ProviderRequest):
     # 用 event.message_str 做检索 query（不用 req.prompt，
     # 避免被群聊上下文插件等改写、召回被稀释）
-    query = event.message_str
+    query = event.get_message_str()
     memories = await retriever.recall(session_id, chat_type, query, speaker_id)
     if memories:
-        # 前置到 prompt，不动 system_prompt，保护 prompt cache
-        req.prompt = f"[相关记忆]\n{memories}\n[/相关记忆]\n\n{req.prompt}"
+        # v4 官方推荐姿势：append 到 extra_user_content_parts + mark_as_temp
+        # 效果：只在本轮 provider 请求追加，不进 contexts 历史，
+        #      不动 system_prompt，prompt cache 完好
+        req.extra_user_content_parts.append(
+            TextPart(text=f"[相关记忆]\n{memories}\n[/相关记忆]").mark_as_temp()
+        )
 ```
 
-**关键**：v3.5.24 的 `ProviderRequest` 只有 `prompt / system_prompt / contexts / image_urls`，没有 `extra_user_content_parts` 或 `mark_as_temp()` 接口。等价做法是前置到 `req.prompt`——system_prompt 保持稳定（cache 不破），记忆随 prompt 每轮变化。
+**关键**：v4 的 `ProviderRequest` 有 `extra_user_content_parts: list[ContentPart]` 字段，专门用于本轮追加内容；`TextPart.mark_as_temp()` 会把 `_no_save=True`，保证 provider 发完请求后不会持久化到对话上下文（`entities.py:100`，`agent/message.py:66`）。
+
+v4 官方 `astrbot/builtin_stars/astrbot/group_chat_context.py:194-197` 就是这个用法（虽然它没调 `mark_as_temp` —— 但对我们的场景 mark_as_temp 更保险）。
 
 ---
 
@@ -370,8 +379,10 @@ for eid in scores:
   - 不带出任何私聊或其他群
   - 防止群里泄漏隐私
 
-### 6.4 注入格式（前置到 req.prompt，不动 system_prompt）
+### 6.4 注入格式（extra_user_content_parts + mark_as_temp）
 ```python
+from astrbot.core.agent.message import TextPart
+
 memory_text = "\n\n".join([
     f"[{fmt_date(ep.event_start_at)} · {chat_type_label} · {ep.title}]\n"
     f"{ep.content}\n"
@@ -379,10 +390,17 @@ memory_text = "\n\n".join([
     for ep in top_episodes
 ])
 
-req.prompt = f"[相关记忆]\n{memory_text}\n[/相关记忆]\n\n{req.prompt}"
+req.extra_user_content_parts.append(
+    TextPart(text=f"[相关记忆]\n{memory_text}\n[/相关记忆]").mark_as_temp()
+)
 ```
 
 **不带**：embedding score、内部 ID、JSON、关系图。
+
+**为什么 mark_as_temp**：
+- `_no_save=True` 让这块内容只在**本轮 provider 请求**里出现
+- 不会被写入 `contexts` 历史，下一轮不会重复出现
+- system_prompt / prompt 全部不动，provider 侧 prompt cache 命中率不受影响
 
 ---
 
@@ -448,7 +466,7 @@ req.prompt = f"[相关记忆]\n{memory_text}\n[/相关记忆]\n\n{req.prompt}"
 9. ✅ 私聊自动召回群聊事件；群聊自动召回不带出任何私聊 episode
 10. ✅ raw message 过期删除后，episode 与检索仍正常
 11. ✅ hook 重复触发（插件 reload / 消息重放）不会脏库（dedupe_key UNIQUE）
-12. ✅ prompt cache 不被破坏（system_prompt 不动，记忆前置到 prompt）
+12. ✅ prompt cache 不被破坏（system_prompt / prompt / contexts 全部不动，记忆走 extra_user_content_parts + mark_as_temp）
 13. ✅ process_batch 并发触发不会重复消化同一批 raw（per-session lock）
 
 ---
