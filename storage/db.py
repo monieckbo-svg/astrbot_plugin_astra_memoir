@@ -81,6 +81,14 @@ class MemoirDB:
         ):
             if name not in episode_columns:
                 conn.execute(f"ALTER TABLE episodes ADD COLUMN {name} {definition}")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ep_active_time "
+            "ON episodes(is_archived, event_start_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ep_active_chat_time "
+            "ON episodes(is_archived, chat_type, event_start_at DESC)"
+        )
 
         previous = dict(conn.execute("SELECT key, value FROM meta WHERE key IN ('embedding_dim', 'embedding_provider_id')").fetchall())
         vec_exists = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'episode_vec'").fetchone() is not None

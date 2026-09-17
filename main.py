@@ -59,15 +59,16 @@ class AstraMemoir(Star):
         )
 
         retr_cfg = RetrieverConfig(
-            top_k=max(1, min(int(self._cfg("retrieval_top_k", 3)), 5)),
+            top_k=max(1, min(int(self._cfg("private_recall_top_k", 3)), 5)),
+            private_recall_max=max(1, min(int(self._cfg("private_recall_max", 5)), 5)),
+            group_group_quota=max(0, min(int(self._cfg("group_group_quota", 3)), 5)),
+            group_private_quota=max(0, min(int(self._cfg("group_private_quota", 1)), 5)),
+            group_total_max=max(1, min(int(self._cfg("group_total_max", 4)), 5)),
             max_cosine_distance=float(self._cfg("retrieval_max_cosine_distance", 0.9)),
-            enable_group_recall_in_private=bool(
-                self._cfg("enable_group_recall_in_private", True)
-            ),
             owner_qq_id=str(self._cfg("owner_qq_id", "") or "").strip(),
         )
-        logger.info("[Memoir] private→group recall: enabled=%s, owner_qq_id=%r",
-                    retr_cfg.enable_group_recall_in_private, retr_cfg.owner_qq_id)
+        logger.info("[Memoir] unified recall enabled (owner_qq_id=%r is identity only)",
+                    retr_cfg.owner_qq_id)
 
         # ---- 异步初始化：先确定 provider/dim，才能创建 vec 表 ----
         data_dir = StarTools.get_data_dir(PLUGIN_NAME)

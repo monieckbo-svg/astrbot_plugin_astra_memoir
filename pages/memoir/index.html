@@ -476,17 +476,19 @@ async function runDebugRecall() {
       html += results.map((res, i) => {
         const dt = new Date(res.event_start_at * 1000).toLocaleString();
         const tag = res.chat_type === 'group' ? 'tag-group' : 'tag-private';
-        const tagLabel = res.chat_type === 'group' ? '群聊' : '私聊';
+        const tagLabel = res.chat_type === 'group'
+          ? (d.scope.group_id && res.group_id !== d.scope.group_id ? '其它群聊' : '群聊')
+          : `与${res.source_partner || '未知'}私聊`;
         const vec = res.vec_distance !== null && res.vec_distance !== undefined
           ? `vec_dist=${res.vec_distance.toFixed(4)}` : 'vec=none';
         return `<div class="card result-row">
           <div class="ep-title">
-            #${i + 1} <span class="tag ${tag}">${tagLabel}</span>${escapeHtml(res.title)}
+            #${i + 1} <span class="tag ${tag}">${escapeHtml(tagLabel)}</span>${escapeHtml(res.title)}
           </div>
           <div class="ep-meta">${dt} · id=${res.episode_id}</div>
           <div class="ep-content">${escapeHtml(res.content)}</div>
           <div class="ep-parts">参与者：${escapeHtml(res.participants.join('、'))}</div>
-          <div class="result-scores">${vec} · fts_hit=${res.fts_hit} · relevance_passed=${res.relevance_passed} · rrf=${res.rrf_score.toFixed(4)} · participant=${res.participant_bonus.toFixed(4)} · recency=${res.recency_bonus.toFixed(4)} · decay=${(res.decay_factor ?? 1).toFixed(4)} · final=${res.final_score.toFixed(4)}</div>
+          <div class="result-scores">${res.structured ? 'structured · ' : ''}${vec} · fts_hit=${res.fts_hit} · relevance_passed=${res.relevance_passed} · rrf=${res.rrf_score.toFixed(4)} · participant=${res.participant_bonus.toFixed(4)} · source=${(res.source_bonus ?? 0).toFixed(4)} · recency=${res.recency_bonus.toFixed(4)} · decay=${(res.decay_factor ?? 1).toFixed(4)} · final=${res.final_score.toFixed(4)}</div>
         </div>`;
       }).join('');
     }

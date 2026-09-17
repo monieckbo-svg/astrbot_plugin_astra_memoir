@@ -55,23 +55,38 @@
     "type": "int",
     "default": 30
   },
-  "retrieval_top_k": {
-    "description": "每次注入给星星的记忆条数上限（最多 5 条）",
+  "private_recall_top_k": {
+    "description": "私聊时注入记忆条数（统一候选池，最多 5 条）",
     "type": "int",
     "default": 3
+  },
+  "private_recall_max": {
+    "description": "私聊注入硬上限（最多 5 条）",
+    "type": "int",
+    "default": 5
+  },
+  "group_group_quota": {
+    "description": "群聊时最多取几条群聊来源记忆（包括其他群）",
+    "type": "int",
+    "default": 3
+  },
+  "group_private_quota": {
+    "description": "群聊时最多取几条任意私聊来源记忆",
+    "type": "int",
+    "default": 1
+  },
+  "group_total_max": {
+    "description": "群聊总注入上限（最多 5 条）",
+    "type": "int",
+    "default": 4
   },
   "retrieval_max_cosine_distance": {
     "description": "相关性阈值：向量距离超过这个值且 FTS 未命中的候选会被丢弃（避免注入不相关记忆）。sqlite-vec 的 cosine distance 范围 [0, 2]，越小越近。默认 0.9 保守，真实数据后再调；改大→召回更宽松；改小→更严格",
     "type": "float",
     "default": 0.9
   },
-  "enable_group_recall_in_private": {
-    "description": "允许名单中的私聊用户跨群召回群聊事件。其他私聊用户只可查自己的私聊记忆",
-    "type": "bool",
-    "default": true
-  },
   "owner_qq_id": {
-    "description": "允许在私聊召回所有群聊记忆的 owner QQ 号；留空则任何私聊都不能跨群召回",
+    "description": "owner 的 QQ 身份标识，仅用于身份映射和面板显示；不控制记忆可见性",
     "type": "string",
     "default": ""
   },

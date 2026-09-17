@@ -41,7 +41,7 @@ const bridge = {
     calls.push(route);
     if (route === 'debug/recall') return {query: '测试', scope: {
       resolved_owner_id: '111', current_speaker_id: '111', is_owner: true,
-      visibility_scope: 'private_session+all_groups',
+      visibility_scope: 'all_unarchived_episodes',
     }, results: []};
     if (route === 'vectors/repair') return {repaired: 0, failed: 0};
     throw Error(route);
@@ -67,7 +67,7 @@ vm.runInNewContext(script, sandbox);
   element('dbgQuery').value = '测试';
   await sandbox.runDebugRecall();
   assert.match(element('dbgResults').innerHTML, /无命中/);
-  assert.match(element('dbgResults').innerHTML, /private_session\+all_groups/);
+  assert.match(element('dbgResults').innerHTML, /all_unarchived_episodes/);
   assert.match(element('dbgResults').innerHTML, /resolved_owner_id: 111/);
   await sandbox.repairVectors();
   assert.match(element('repairResult').textContent, /补齐 0 条/);

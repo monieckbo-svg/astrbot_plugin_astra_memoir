@@ -4,8 +4,8 @@ retriever_test.py — Phase 1e 8 个必测场景
 覆盖 GPT 反馈第 11 条：
   1. 私聊能召回同一 private session 的旧事件
   2. 私聊能召回群聊事件
-  3. 私聊不能召回别人的 private
-  4. 群聊不能召回任何 private
+  3. 私聊可召回别人的 private
+  4. 群聊按来源配额召回所有 private
   5. participant 不在事件里但语义相关仍能召回
   6. 完全无关 query 返回空
   7. 同一 episode 同时被 vec 和 FTS 命中只出现一次
@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import types
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -252,16 +253,20 @@ async def main():
     schema = json.loads((_PKG_DIR / "_conf_schema.json").read_text(encoding="utf-8"))
     assert "owner_qq_id" in schema
     assert schema["owner_qq_id"]["type"] == "string"
+    assert schema["private_recall_top_k"]["default"] == 3
+    assert schema["group_group_quota"]["default"] == 3
+    assert schema["group_private_quota"]["default"] == 1
     main_mod = importlib.import_module(f"{_PKG}.main")
     captured = {}
     async def fake_initialize(self, *args):
         captured["retr_cfg"] = args[-1]
     with patch.object(main_mod.AstraMemoir, "_initialize", fake_initialize):
         plugin = main_mod.AstraMemoir(FakeContext(ThemeEmbedding()), {
-            "owner_qq_id": 111, "enable_group_recall_in_private": True,
+            "owner_qq_id": 111,
         })
         await plugin._startup_task
     assert captured["retr_cfg"].owner_qq_id == "111"
+    assert captured["retr_cfg"].top_k == 3
     print("✓ schema 与运行配置均读取 owner_qq_id")
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -276,6 +281,16 @@ async def main():
 
         e1, e2, e3, e4, e5 = await prepare_data(db, vec, embed)
         print(f"prepared episodes: e1={e1} e2={e2} e3={e3} e4={e4} e5={e5}")
+
+        now = int(time.time())
+        other_group = db.insert_episode(
+            platform="qq", chat_type="group", session_id="grp_other", group_id="g_other",
+            title="另群插件模型", content="另一个群讨论插件模型", source_raw_ids=[],
+            event_start_at=now, event_end_at=now, extracted_at=now,
+        )
+        db.insert_fts(other_group, "另群插件模型", "另一个群讨论插件模型", ["插件"])
+        vec.upsert(other_group, await embed.get_embedding("插件"), chat_type="group",
+                   session_id="grp_other", group_id="g_other")
 
         # === 1. 私聊能召回同一 private session 的旧事件 ===
         r = await retr.recall(
@@ -295,7 +310,19 @@ async def main():
         assert e3 in ids, f"私聊应召回群聊'小雨感冒'，got {ids}"
         print(f"✓ 场景 2: 私聊召回群聊事件 ({ids})")
 
-        # 同一 query 在群聊/owner 私聊/非 owner 私聊下的可见性回归。
+        cross_group = await retr.recall(
+            "另群插件模型", session_id="grp", chat_type="group",
+            group_id="g_main", current_speaker_id="222",
+        )
+        assert other_group in {r.episode_id for r in cross_group}
+        assert all(r.chat_type == "group" for r in cross_group), "无相关私聊时不应硬凑 private quota"
+        assert "其它群聊" in retr.format_injection(cross_group, current_group_id="g_main")
+        assert len([r for r in cross_group if r.chat_type == "group"]) <= 3
+        assert len([r for r in cross_group if r.chat_type == "private"]) <= 1
+        assert any(r.debug_source_bonus > 0 for r in cross_group if r.group_id == "g_main")
+        assert all(r.debug_source_bonus == 0 for r in cross_group if r.group_id == "g_other")
+
+        # 同一 query 在群聊/owner 私聊/非 owner 私聊下均可召回。
         group = await retr.recall(
             "插件报错", session_id="grp", chat_type="group",
             group_id="g_main", current_speaker_id="222",
@@ -310,13 +337,13 @@ async def main():
         )
         assert e2 in {x.episode_id for x in group}
         assert e2 in {x.episode_id for x in owner}
-        assert e2 not in {x.episode_id for x in non_owner}
+        assert e2 in {x.episode_id for x in non_owner}
         scope = retr.visibility_info("private", "priv_A", None, " 111 ")
         assert scope["resolved_owner_id"] == "111"
         assert scope["current_speaker_id"] == "111"
         assert scope["is_owner"] is True
-        assert scope["visibility_scope"] == "private_session+all_groups"
-        assert retr.visibility_info("private", "priv_B", None, "222")["visibility_scope"] == "private_session_only"
+        assert scope["visibility_scope"] == "all_unarchived_episodes"
+        assert retr.visibility_info("private", "priv_B", None, "222")["visibility_scope"] == "all_unarchived_episodes"
         panel_mod = importlib.import_module(f"{_PKG}.pipeline.panel")
         panel = object.__new__(panel_mod.MemoirPanel)
         panel.retriever = retr
@@ -329,24 +356,24 @@ async def main():
         assert debug["data"]["scope"]["resolved_owner_id"] == "111"
         assert debug["data"]["scope"]["current_speaker_id"] == "111"
         assert debug["data"]["scope"]["is_owner"] is True
-        assert debug["data"]["scope"]["visibility_scope"] == "private_session+all_groups"
+        assert debug["data"]["scope"]["visibility_scope"] == "all_unarchived_episodes"
         assert e2 in {item["episode_id"] for item in debug["data"]["results"]}
-        print("✓ owner QQ 类型/空格归一化，私聊跨群与非 owner 隔离")
+        print("✓ owner 仅身份标识，所有私聊均可跨会话召回")
 
         ordinary = await retr.recall(
             "小雨怎么了", session_id="priv_B", chat_type="private",
             group_id=None, current_speaker_id="222",
         )
-        assert e3 not in {x.episode_id for x in ordinary}, "非 owner 私聊不能跨群召回"
+        assert e3 in {x.episode_id for x in ordinary}, "非 owner 私聊也能跨群召回"
 
-        # === 3. 私聊不能召回别人的 private ===
+        # === 3. 私聊能召回别人的 private ===
         r = await retr.recall(
             "天气", session_id="priv_A", chat_type="private",
             group_id=None, current_speaker_id="111",
         )
         ids = [x.episode_id for x in r]
-        assert e4 not in ids, f"私聊不应召回别人的 private，got {ids}"
-        print(f"✓ 场景 3: 私聊隔离别人的 private (query='天气', got {ids})")
+        assert e4 in ids, f"私聊应召回别人的 private，got {ids}"
+        print(f"✓ 场景 3: 私聊统一召回别人的 private (query='天气', got {ids})")
 
         # === 4. 用户明确开启群聊检索私聊（包括其他人的私聊）===
         r = await retr.recall(
@@ -354,10 +381,41 @@ async def main():
             group_id="g_main", current_speaker_id="222",
         )
         ids = [x.episode_id for x in r]
-        assert e1 in ids, f"群聊应能召回 e1，got {ids}"
-        assert e4 in ids, f"群聊应能召回其他人私聊 e4，got {ids}"
-        assert retr.visibility_info("group", "grp", "g_main", "222")["visibility_scope"] == "current_group+all_private"
-        print(f"✓ 场景 4: 群聊统一检索当前群和全部 private ({ids})")
+        assert e1 in ids or e4 in ids, f"群聊应能召回 private，got {ids}"
+        assert sum(x.chat_type == "private" for x in r) <= 1
+        assert retr.visibility_info("group", "grp", "g_main", "222")["visibility_scope"] == "all_unarchived_episodes"
+        print(f"✓ 场景 4: 群聊统一候选，private 配额至多1条 ({ids})")
+
+        recent_group = await retr.recall(
+            "刚刚群里聊啥", session_id="priv_A", chat_type="private",
+            group_id=None, current_speaker_id="111",
+        )
+        assert recent_group and all(r.chat_type == "group" and r.debug_structured for r in recent_group)
+        assert len(recent_group) <= 5
+        yesterday_morning = (datetime.fromtimestamp(now).replace(
+            hour=9, minute=0, second=0, microsecond=0) - timedelta(days=1)
+        )
+        old_group = db.insert_episode(
+            platform="qq", chat_type="group", session_id="grp_old", group_id="g_old",
+            title="昨天上午群聊", content="昨日上午讨论插件回忆", source_raw_ids=[],
+            event_start_at=int(yesterday_morning.timestamp()),
+            event_end_at=int(yesterday_morning.timestamp()), extracted_at=now,
+        )
+        vec.upsert(old_group, await embed.get_embedding("插件"), chat_type="group",
+                   session_id="grp_old", group_id="g_old")
+        yesterday = await retr.recall(
+            "昨天上午群里聊了什么", session_id="priv_A", chat_type="private",
+            group_id=None, current_speaker_id="111",
+        )
+        assert old_group in {r.episode_id for r in yesterday}
+        assert all(r.debug_structured for r in yesterday)
+        specific = await retr.recall(
+            "昨天上午群里的插件", session_id="priv_A", chat_type="private",
+            group_id=None, current_speaker_id="111",
+        )
+        assert old_group in {r.episode_id for r in specific}
+        assert all(not r.debug_structured for r in specific)
+        print("✓ 跨群候选、群聊来源配额、刚刚/昨天上午结构化召回")
 
         # === 5. participant 不在事件里但语义相关仍能召回 ===
         #   陆忱(111) 没参与 e3（小雨感冒），但语义相关应能召回

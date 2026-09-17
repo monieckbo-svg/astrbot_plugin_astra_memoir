@@ -381,20 +381,21 @@ for rank, eid in enumerate(fts_hits):
 # 加分（都不做硬过滤）
 for eid in scores:
     if current_speaker in participants[eid]:
-        scores[eid] += 0.02  # participant bonus
+        scores[eid] += 0.001  # participant bonus
     days_ago = (now - event_end_at[eid]) / 86400
-    scores[eid] += 0.01 * exp(-days_ago / 30)  # recency
+    scores[eid] += 0.003 * exp(-days_ago / 30)  # recency
+
+# 当前 session / 当前群额外 +0.002；最终乘 importance decay。
 
 # 取 top_k
 ```
 
-### 6.3 私聊 / 群聊边界（信息可见性）
-- **配置在 `owner_qq_id` 中的 owner 私聊时**：召回范围 = 当前私聊 episode ∪ **所有 QQ 群聊 episode**
-  - 所以能问 "上午群里那个插件后来怎么了"
-- 其他私聊用户：仅能召回自己的私聊 episode
-- **Astra 在群里时**：召回范围 = **当前群 episode ∪ 所有私聊 episode**
-  - 用户明确授权开放私聊候选；群成员可触发私人记忆注入，存在泄漏风险
-  - 其他群的群聊 episode 不进入候选
+### 6.3 统一候选池与来源配额
+- 所有有效场景：全库未归档 episode 都可成为候选；`owner_qq_id` 仅是身份标识，不是权限门槛。
+- 私聊：全来源统一排序，默认最多 3 条，硬上限 5 条。
+- 群聊：当前群和其它群统一进入 group 池（最多 3 条）；所有私聊进入 private 池（最多 1 条）；合并后默认总上限 4 条。相关性不足时不凑数。
+- 当前群/当前私聊和参与者只得轻微 bonus，不硬过滤其它来源。宽泛的“刚刚群里”“昨天上午群里”等问法走来源＋时间窗口查询。
+- 这是用户明确授权的共享记忆模式：任何聊天者都可能触发别的私聊或群聊记忆注入，有信息泄漏风险。
 
 ### 6.4 注入格式（extra_user_content_parts + mark_as_temp）
 ```python
@@ -456,9 +457,12 @@ req.extra_user_content_parts.append(
   "overlap_group_messages":    4,
   "overlap_private_messages":  2,
   "raw_retention_days":        30,
-  "retrieval_top_k":           3,
-  "enable_group_recall_in_private": true,
-  "owner_qq_id":              "owner QQ，单个 QQ 号",
+  "private_recall_top_k":      3,
+  "private_recall_max":        5,
+  "group_group_quota":         3,
+  "group_private_quota":       1,
+  "group_total_max":          4,
+  "owner_qq_id":              "owner QQ，仅身份标识",
   "scheduler_interval_seconds": 60
 }
 ```
@@ -477,7 +481,7 @@ req.extra_user_content_parts.append(
 6. ✅ 群聊跨批次同一件事，overlap 能帮理解，每个 episode 必须引用至少一个新批次 raw_id
 7. ✅ 群友 A 的事实绝不归到群友 B 名下（QQ ID 由代码回查决定）
 8. ✅ Astra 群里参与时，Astra 出现在 participants（用 event.get_self_id()）
-9. ✅ owner 私聊自动召回群聊事件；群聊自动召回可使用所有私聊 episode（用户已授权）
+9. ✅ 全场景可检索所有未归档 episode；群聊按来源配额注入（用户已授权）
 10. ✅ raw message 过期删除后，episode 与检索仍正常
 11. ✅ hook 重复触发（插件 reload / 消息重放）不会脏库（dedupe_key UNIQUE）
 12. ✅ prompt cache 不被破坏（system_prompt / prompt / contexts 全部不动，记忆走 extra_user_content_parts + mark_as_temp）
