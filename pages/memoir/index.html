@@ -199,7 +199,30 @@
 
 <script>
 // ============ Bridge ============
-const bridge = window.AstrBotPluginPage || null;
+// AstrBot 会自动在 </body> 前注入 bridge script（异步加载），
+// 我们的内联 JS 可能先执行，此时 window.AstrBotPluginPage 还没准备好。
+// 所以 poll 一下等它出现。
+let bridge = null;
+
+function waitForBridge(timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    if (window.AstrBotPluginPage) {
+      bridge = window.AstrBotPluginPage;
+      return resolve(bridge);
+    }
+    const start = Date.now();
+    const iv = setInterval(() => {
+      if (window.AstrBotPluginPage) {
+        clearInterval(iv);
+        bridge = window.AstrBotPluginPage;
+        resolve(bridge);
+      } else if (Date.now() - start > timeoutMs) {
+        clearInterval(iv);
+        reject(new Error('bridge load timeout'));
+      }
+    }, 50);
+  });
+}
 
 function api(path, params) {
   if (!bridge) return Promise.reject(new Error('bridge not loaded'));
@@ -460,12 +483,14 @@ function escapeHtml(s) {
 
 // ============ Boot ============
 (async function boot() {
-  if (!bridge) {
-    document.querySelector('main').innerHTML = '<div class="error">Plugin bridge SDK 未加载</div>';
-    return;
+  try {
+    await waitForBridge();
+    await bridge.ready();
+    loadStats();
+  } catch (e) {
+    document.querySelector('main').innerHTML =
+      `<div class="error">Plugin bridge SDK 加载失败：${e.message}</div>`;
   }
-  await bridge.ready();
-  loadStats();
 })();
 </script>
 </body>
