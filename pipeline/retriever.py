@@ -134,7 +134,7 @@ class Retriever:
 
     @staticmethod
     def decay_factor(ep, now: int) -> float:
-        """只影响排名，不物理删除；旧库默认 importance=3。"""
+        """只影响排名，不物理删除；首次迁移的旧记忆默认 importance=2。"""
         importance = int(ep["importance"])
         if importance <= 1:
             return 0.0

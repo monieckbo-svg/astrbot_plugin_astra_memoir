@@ -428,7 +428,7 @@ req.extra_user_content_parts.append(
 - 已 processed 且 `created_at < now - retention_days` → 删除
 - 未处理的永不删（保护未消化数据）
 
-原文默认 `retention_days = 30`。episode 不物理删除；importance=1 不写 episode，importance=2 超过 30 天无强化归档，其他 importance 按检索时效衰减。旧 episode 迁移后默认 importance=3。
+原文默认 `retention_days = 30`。episode 不物理删除；importance=1 不写 episode，importance=2 超过 30 天无强化归档，其他 importance 按检索时效衰减。首次迁移尚无 importance 列的旧 episode 默认 importance=2；已有该列的数据库不批量改写既有评分。
 
 ---
 

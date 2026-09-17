@@ -52,7 +52,7 @@ async def main():
         db.initialize()
         try:
             old_ep = db.fetchone("SELECT * FROM episodes WHERE id = 1")
-            assert old_ep["importance"] == 3 and old_ep["is_archived"] == 0
+            assert old_ep["importance"] == 2 and old_ep["is_archived"] == 0
             assert old_ep["reinforcement_count"] == 0
             assert "is_archived" in {row["name"] for row in db.fetchall("PRAGMA table_info(episode_vec)")}
             assert db.fetchone("SELECT COUNT(*) FROM episode_vec")[0] == 0
@@ -163,6 +163,14 @@ async def main():
                        for i in batch_ids)
         finally:
             db.close()
+        # 再次启动不能把新版评分过的记忆从 3 重评为 2。
+        reopened = MemoirDB(path, embedding_dim=8)
+        reopened.initialize()
+        try:
+            assert reopened.fetchone("SELECT importance FROM episodes WHERE id = 1")[0] == 2
+            assert reopened.fetchone("SELECT importance FROM episodes WHERE id = ?", (eid,))[0] == 3
+        finally:
+            reopened.close()
     print("Memory lifecycle test passed")
 
 

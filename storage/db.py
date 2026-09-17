@@ -74,7 +74,9 @@ class MemoirDB:
         # 旧库增量迁移；保留 episodes / FTS / raw，不重建用户数据。
         episode_columns = {row["name"] for row in conn.execute("PRAGMA table_info(episodes)")}
         for name, definition in (
-            ("importance", "INTEGER NOT NULL DEFAULT 3"),
+            # 仅首次迁移无 importance 列的旧 episode 为短期记忆；
+            # 已有 importance 的新事件不能在后续启动时被重评。
+            ("importance", "INTEGER NOT NULL DEFAULT 2"),
             ("last_reinforced_at", "TEXT"),
             ("reinforcement_count", "INTEGER NOT NULL DEFAULT 0"),
             ("is_archived", "INTEGER NOT NULL DEFAULT 0"),
