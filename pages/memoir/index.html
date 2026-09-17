@@ -199,8 +199,7 @@
 
 <script>
 // ============ Bridge ============
-let bridgeReady = false;
-const bridge = window.astrbotPluginPageBridge || null;
+const bridge = window.AstrBotPluginPage || null;
 
 function api(path, params) {
   if (!bridge) return Promise.reject(new Error('bridge not loaded'));
