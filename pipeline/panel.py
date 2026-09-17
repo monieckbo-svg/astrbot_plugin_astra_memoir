@@ -5,29 +5,46 @@ pipeline/panel.py — 管理面板 API endpoint
 访问路径：/api/v1/plugins/extensions/astrbot_plugin_astra_memoir/*
 
 Endpoints:
-- GET  /stats           首页数字（episode 总数、今日新增、raw 未处理数等）
-- GET  /episodes        Episode 列表，支持筛选和分页
-- GET  /episodes/{id}   Episode 详情 + 原始证据回查
-- GET  /raw             近期原文列表，支持筛选
-- POST /debug/recall    模拟检索，返回候选和各路分数
+- GET  /stats                   首页数字
+- GET  /episodes                Episode 列表，支持筛选和分页
+- GET  /episodes/<episode_id>   Episode 详情 + 原始证据回查
+- GET  /raw                     近期原文列表，支持筛选
+- POST /debug/recall            模拟检索
 
-view_handler 签名: async def h(...) -> dict[str, Any]
-AstrBot 会自动 JSON 序列化。Request 通过 bind_request_context 里的 context 取。
+View handler 签名: view_func(**path_params) —— AstrBot 只把 URL path 参数作为
+kwargs 传入。要拿 query string / body，用 astrbot.api.web.request module-level proxy。
 """
 from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
 
 from astrbot.api import logger
+from astrbot.api.web import request as astr_request
 
 from ..storage import MemoirDB, VecStore
-from .retriever import Retriever, RetrieverConfig
+from .retriever import Retriever
 
 
 def _row_to_dict(row) -> dict:
     return dict(row) if row is not None else {}
+
+
+def _query(key: str, default=None):
+    try:
+        return astr_request.query.get(key, default)
+    except Exception:
+        return default
+
+
+async def _json_body() -> dict:
+    try:
+        body = await astr_request.json()
+        if isinstance(body, dict):
+            return body
+    except Exception:
+        pass
+    return {}
 
 
 class MemoirPanel:
@@ -36,7 +53,7 @@ class MemoirPanel:
         db: MemoirDB,
         vec: VecStore,
         retriever: Retriever,
-        scheduler,  # BatchScheduler
+        scheduler,
     ):
         self.db = db
         self.vec = vec
@@ -48,7 +65,7 @@ class MemoirPanel:
     async def get_stats(self) -> dict:
         def _q():
             now = int(time.time())
-            today_start = now - now % 86400  # UTC，够用
+            today_start = now - now % 86400
             episodes_total = self.db.fetchone(
                 "SELECT COUNT(*) AS n FROM episodes"
             )["n"]
@@ -66,13 +83,11 @@ class MemoirPanel:
             last_extracted = self.db.fetchone(
                 "SELECT MAX(extracted_at) AS t FROM episodes"
             )["t"]
-
             sessions_active = self.db.fetchall(
                 "SELECT session_id, chat_type, group_id, COUNT(*) AS unprocessed_count "
                 "FROM recent_messages WHERE processed_at IS NULL "
                 "GROUP BY session_id ORDER BY unprocessed_count DESC LIMIT 20"
             )
-
             return {
                 "episodes_total": episodes_total,
                 "episodes_today": episodes_today,
@@ -84,19 +99,28 @@ class MemoirPanel:
                 "active_sessions": [_row_to_dict(r) for r in sessions_active],
             }
 
-        return {"status": "ok", "data": await self.db.run(_q)}
+        try:
+            return {"status": "ok", "data": await self.db.run(_q)}
+        except Exception as e:
+            logger.exception("[Memoir] get_stats 异常")
+            return {"status": "error", "message": str(e), "data": {}}
 
     # ---------- episodes list ----------
 
-    async def list_episodes(self, request) -> dict:
-        q = _query_params(request)
-        chat_type = q.get("chat_type")  # private / group / None
-        participant = q.get("participant")  # speaker_id
-        session_id = q.get("session_id")
-        group_id = q.get("group_id")
-        search = q.get("q")  # FTS
-        limit = min(int(q.get("limit", 50)), 200)
-        offset = int(q.get("offset", 0))
+    async def list_episodes(self) -> dict:
+        chat_type = _query("chat_type")
+        participant = _query("participant")
+        session_id = _query("session_id")
+        group_id = _query("group_id")
+        search = _query("q")
+        try:
+            limit = min(int(_query("limit", 50)), 200)
+        except (TypeError, ValueError):
+            limit = 50
+        try:
+            offset = int(_query("offset", 0))
+        except (TypeError, ValueError):
+            offset = 0
 
         def _q():
             conditions = []
@@ -113,7 +137,6 @@ class MemoirPanel:
                 params.append(group_id)
 
             if participant:
-                # 用 JOIN participants
                 sql_base = (
                     "SELECT DISTINCT e.* FROM episodes e "
                     "JOIN episode_participants p ON p.episode_id = e.id "
@@ -126,13 +149,12 @@ class MemoirPanel:
                 sql = sql_base + " ORDER BY e.event_end_at DESC LIMIT ? OFFSET ?"
                 params_final = [*params_base, limit, offset]
             elif search:
-                # FTS
                 sql = (
-                    "SELECT e.* FROM episodes_fts f "
-                    "JOIN episodes e ON e.id = f.rowid "
+                    "SELECT e.* FROM episodes_fts "
+                    "JOIN episodes e ON e.id = episodes_fts.rowid "
                     "WHERE episodes_fts MATCH ?"
                 )
-                params_final = [search]
+                params_final: list = [search]
                 if conditions:
                     sql += " AND " + " AND ".join(f"e.{c}" for c in conditions)
                     params_final.extend(params)
@@ -146,7 +168,6 @@ class MemoirPanel:
                 params_final = [*params, limit, offset]
 
             eps = self.db.fetchall(sql, tuple(params_final))
-            # 附上 participants
             result = []
             for e in eps:
                 ep_dict = _row_to_dict(e)
@@ -159,8 +180,12 @@ class MemoirPanel:
                 result.append(ep_dict)
             return result
 
-        eps = await self.db.run(_q)
-        return {"status": "ok", "data": eps, "count": len(eps)}
+        try:
+            eps = await self.db.run(_q)
+            return {"status": "ok", "data": eps, "count": len(eps)}
+        except Exception as e:
+            logger.exception("[Memoir] list_episodes 异常")
+            return {"status": "error", "message": str(e), "data": []}
 
     # ---------- episode detail ----------
 
@@ -189,7 +214,6 @@ class MemoirPanel:
             )
             ep_dict["keywords"] = [k["keyword"] for k in keywords]
 
-            # 回查 raw evidence
             try:
                 source_ids = json.loads(ep["source_raw_ids"])
             except Exception:
@@ -205,7 +229,6 @@ class MemoirPanel:
                     source_ids,
                 )
                 ep_dict["raw_evidence"] = [_row_to_dict(r) for r in raws]
-                # 缺失的 raw（已被 TTL 清理）
                 found_ids = {r["id"] for r in raws}
                 ep_dict["raw_missing_ids"] = [
                     i for i in source_ids if i not in found_ids
@@ -214,7 +237,6 @@ class MemoirPanel:
                 ep_dict["raw_evidence"] = []
                 ep_dict["raw_missing_ids"] = []
 
-            # vec 状态
             vec_row = self.db.fetchone(
                 "SELECT episode_id FROM episode_vec WHERE episode_id = ?", (eid,)
             )
@@ -222,21 +244,30 @@ class MemoirPanel:
 
             return ep_dict
 
-        ep = await self.db.run(_q)
-        if ep is None:
-            return {"status": "error", "message": "episode not found"}
-        return {"status": "ok", "data": ep}
+        try:
+            ep = await self.db.run(_q)
+            if ep is None:
+                return {"status": "error", "message": "episode not found"}
+            return {"status": "ok", "data": ep}
+        except Exception as e:
+            logger.exception("[Memoir] episode_detail 异常")
+            return {"status": "error", "message": str(e)}
 
     # ---------- recent raw ----------
 
-    async def list_raw(self, request) -> dict:
-        q = _query_params(request)
-        chat_type = q.get("chat_type")
-        session_id = q.get("session_id")
-        role = q.get("role")
-        processed = q.get("processed")  # "true" / "false" / None
-        limit = min(int(q.get("limit", 100)), 500)
-        offset = int(q.get("offset", 0))
+    async def list_raw(self) -> dict:
+        chat_type = _query("chat_type")
+        session_id = _query("session_id")
+        role = _query("role")
+        processed = _query("processed")
+        try:
+            limit = min(int(_query("limit", 100)), 500)
+        except (TypeError, ValueError):
+            limit = 100
+        try:
+            offset = int(_query("offset", 0))
+        except (TypeError, ValueError):
+            offset = 0
 
         def _q():
             conditions = []
@@ -263,12 +294,16 @@ class MemoirPanel:
             rows = self.db.fetchall(sql, tuple(params))
             return [_row_to_dict(r) for r in rows]
 
-        return {"status": "ok", "data": await self.db.run(_q)}
+        try:
+            return {"status": "ok", "data": await self.db.run(_q)}
+        except Exception as e:
+            logger.exception("[Memoir] list_raw 异常")
+            return {"status": "error", "message": str(e), "data": []}
 
     # ---------- debug recall ----------
 
-    async def debug_recall(self, request) -> dict:
-        body = await _json_body(request)
+    async def debug_recall(self) -> dict:
+        body = await _json_body()
         query = str(body.get("query", "")).strip()
         chat_type = body.get("chat_type", "private")
         session_id = body.get("session_id", "debug_session")
@@ -278,15 +313,18 @@ class MemoirPanel:
         if not query:
             return {"status": "error", "message": "missing query"}
 
-        results = await self.retriever.recall(
-            query,
-            session_id=session_id,
-            chat_type=chat_type,
-            group_id=group_id,
-            current_speaker_id=current_speaker_id,
-        )
+        try:
+            results = await self.retriever.recall(
+                query,
+                session_id=session_id,
+                chat_type=chat_type,
+                group_id=group_id,
+                current_speaker_id=current_speaker_id,
+            )
+        except Exception as e:
+            logger.exception("[Memoir] debug_recall 异常")
+            return {"status": "error", "message": str(e)}
 
-        # 返回带调试字段的结果
         return {
             "status": "ok",
             "data": {
@@ -315,59 +353,31 @@ class MemoirPanel:
         }
 
 
-# ---------- request helpers ----------
-
-def _query_params(request) -> dict:
-    """兼容 fastapi.Request / quart.Request / 我们自己 mock 的 dict-like。"""
-    try:
-        return dict(request.query_params)
-    except AttributeError:
-        pass
-    try:
-        return dict(request.args)
-    except AttributeError:
-        pass
-    return {}
-
-
-async def _json_body(request) -> dict:
-    """兼容 fastapi.Request.json() / quart.Request.get_json()。"""
-    try:
-        return await request.json()
-    except AttributeError:
-        pass
-    try:
-        return await request.get_json()
-    except AttributeError:
-        pass
-    return {}
-
-
 # ---------- register on context ----------
 
 _ROUTE_PREFIX = "/astrbot_plugin_astra_memoir"
 
 
 def register_panel_routes(context, panel: MemoirPanel):
-    """把 5 个 endpoint 注册到 AstrBot dashboard 上。
-
-    实际请求路径为 /api/v1/plugins/extensions/{plugin_path}, plugin_path 会包含插件名，
-    所以注册时 route 必须带 plugin_name 前缀（否则 _match_registered_web_api 匹配不上）。
+    """
+    View handler 只接受 URL path 参数作为 kwargs（AstrBot 用 view_func(**path_params) 调用）。
+    query string / body 通过 astrbot.api.web.request module-level proxy 获取。
+    Route 必须带 plugin_name 前缀。
     """
     async def h_stats():
         return await panel.get_stats()
 
-    async def h_list_episodes(request):
-        return await panel.list_episodes(request)
+    async def h_list_episodes():
+        return await panel.list_episodes()
 
     async def h_episode_detail(episode_id: str):
         return await panel.episode_detail(episode_id)
 
-    async def h_list_raw(request):
-        return await panel.list_raw(request)
+    async def h_list_raw():
+        return await panel.list_raw()
 
-    async def h_debug_recall(request):
-        return await panel.debug_recall(request)
+    async def h_debug_recall():
+        return await panel.debug_recall()
 
     context.register_web_api(
         f"{_ROUTE_PREFIX}/stats", h_stats, methods=["GET"],
