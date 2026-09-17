@@ -345,8 +345,15 @@ async def _json_body(request) -> dict:
 
 # ---------- register on context ----------
 
+_ROUTE_PREFIX = "/astrbot_plugin_astra_memoir"
+
+
 def register_panel_routes(context, panel: MemoirPanel):
-    """把 5 个 endpoint 注册到 AstrBot dashboard 上。"""
+    """把 5 个 endpoint 注册到 AstrBot dashboard 上。
+
+    实际请求路径为 /api/v1/plugins/extensions/{plugin_path}, plugin_path 会包含插件名，
+    所以注册时 route 必须带 plugin_name 前缀（否则 _match_registered_web_api 匹配不上）。
+    """
     async def h_stats():
         return await panel.get_stats()
 
@@ -363,23 +370,23 @@ def register_panel_routes(context, panel: MemoirPanel):
         return await panel.debug_recall(request)
 
     context.register_web_api(
-        "/stats", h_stats, methods=["GET"],
+        f"{_ROUTE_PREFIX}/stats", h_stats, methods=["GET"],
         desc="Memoir status: episode 总数、今日、未处理 raw 等",
     )
     context.register_web_api(
-        "/episodes", h_list_episodes, methods=["GET"],
+        f"{_ROUTE_PREFIX}/episodes", h_list_episodes, methods=["GET"],
         desc="Memoir episodes list with filtering",
     )
     context.register_web_api(
-        "/episodes/<episode_id>", h_episode_detail, methods=["GET"],
+        f"{_ROUTE_PREFIX}/episodes/<episode_id>", h_episode_detail, methods=["GET"],
         desc="Memoir episode detail with raw evidence",
     )
     context.register_web_api(
-        "/raw", h_list_raw, methods=["GET"],
+        f"{_ROUTE_PREFIX}/raw", h_list_raw, methods=["GET"],
         desc="Memoir recent raw messages",
     )
     context.register_web_api(
-        "/debug/recall", h_debug_recall, methods=["POST"],
+        f"{_ROUTE_PREFIX}/debug/recall", h_debug_recall, methods=["POST"],
         desc="Memoir retrieval simulator (debug)",
     )
 
