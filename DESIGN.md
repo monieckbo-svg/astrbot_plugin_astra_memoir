@@ -389,7 +389,7 @@ for eid in scores:
 ```
 
 ### 6.3 私聊 / 群聊边界（信息可见性）
-- **配置在 `cross_group_owner_ids` 中的 owner 私聊时**：召回范围 = 当前私聊 episode ∪ **所有 QQ 群聊 episode**
+- **配置在 `owner_qq_id` 中的 owner 私聊时**：召回范围 = 当前私聊 episode ∪ **所有 QQ 群聊 episode**
   - 所以能问 "上午群里那个插件后来怎么了"
 - 其他私聊用户：仅能召回自己的私聊 episode
 - **Astra 在群里时**：召回范围 = **仅当前群 episode**
@@ -458,7 +458,7 @@ req.extra_user_content_parts.append(
   "raw_retention_days":        30,
   "retrieval_top_k":           4,
   "enable_group_recall_in_private": true,
-  "cross_group_owner_ids":     "owner QQ，多个用逗号分隔",
+  "owner_qq_id":              "owner QQ，单个 QQ 号",
   "scheduler_interval_seconds": 60
 }
 ```

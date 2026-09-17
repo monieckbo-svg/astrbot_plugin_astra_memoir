@@ -70,8 +70,8 @@
     "type": "bool",
     "default": true
   },
-  "cross_group_owner_ids": {
-    "description": "允许跨群召回的 owner QQ 号，多个用英文逗号分隔；留空则所有私聊都不能跨群召回",
+  "owner_qq_id": {
+    "description": "允许在私聊召回所有群聊记忆的 owner QQ 号；留空则任何私聊都不能跨群召回",
     "type": "string",
     "default": ""
   },

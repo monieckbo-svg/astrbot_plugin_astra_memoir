@@ -64,10 +64,10 @@ class AstraMemoir(Star):
             enable_group_recall_in_private=bool(
                 self._cfg("enable_group_recall_in_private", True)
             ),
-            cross_group_owner_ids=frozenset(
-                x.strip() for x in str(self._cfg("cross_group_owner_ids", "")).replace("，", ",").split(",") if x.strip()
-            ),
+            owner_qq_id=str(self._cfg("owner_qq_id", "") or "").strip(),
         )
+        logger.info("[Memoir] private→group recall: enabled=%s, owner_qq_id=%r",
+                    retr_cfg.enable_group_recall_in_private, retr_cfg.owner_qq_id)
 
         # ---- 异步初始化：先确定 provider/dim，才能创建 vec 表 ----
         data_dir = StarTools.get_data_dir(PLUGIN_NAME)

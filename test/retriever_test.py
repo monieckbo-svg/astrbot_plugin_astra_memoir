@@ -22,7 +22,7 @@ import tempfile
 import time
 import types
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 
 # ---- mock astrbot（同 integration_test）----
@@ -31,6 +31,8 @@ def _mock_astrbot():
     api_api = types.ModuleType("astrbot.api")
     api_api.logger = logging.getLogger("memoir-test")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    api_web = types.ModuleType("astrbot.api.web")
+    api_web.request = object()
 
     api_event = types.ModuleType("astrbot.api.event")
     class _Filter:
@@ -86,6 +88,7 @@ def _mock_astrbot():
 
     sys.modules["astrbot"] = api
     sys.modules["astrbot.api"] = api_api
+    sys.modules["astrbot.api.web"] = api_web
     sys.modules["astrbot.api.event"] = api_event
     sys.modules["astrbot.api.event.filter"] = api_event_filter
     sys.modules["astrbot.api.star"] = api_star
@@ -246,6 +249,21 @@ async def prepare_data(db: MemoirDB, vec: VecStore, embed: ThemeEmbedding):
 # ============================================================
 
 async def main():
+    schema = json.loads((_PKG_DIR / "_conf_schema.json").read_text(encoding="utf-8"))
+    assert "owner_qq_id" in schema
+    assert schema["owner_qq_id"]["type"] == "string"
+    main_mod = importlib.import_module(f"{_PKG}.main")
+    captured = {}
+    async def fake_initialize(self, *args):
+        captured["retr_cfg"] = args[-1]
+    with patch.object(main_mod.AstraMemoir, "_initialize", fake_initialize):
+        plugin = main_mod.AstraMemoir(FakeContext(ThemeEmbedding()), {
+            "owner_qq_id": 111, "enable_group_recall_in_private": True,
+        })
+        await plugin._startup_task
+    assert captured["retr_cfg"].owner_qq_id == "111"
+    print("✓ schema 与运行配置均读取 owner_qq_id")
+
     with tempfile.TemporaryDirectory() as tmp:
         db = MemoirDB(Path(tmp)/"t.db", embedding_dim=8)
         db.initialize()
@@ -253,7 +271,7 @@ async def main():
         embed = ThemeEmbedding()
         context = FakeContext(embed)
         cfg = RetrieverConfig(top_k=5, max_cosine_distance=0.9)
-        cfg.cross_group_owner_ids = frozenset({"111"})
+        cfg.owner_qq_id = 111  # 模拟配置中数值 QQ；运行时必须规范化
         retr = Retriever(embed, db, vec, cfg)
 
         e1, e2, e3, e4, e5 = await prepare_data(db, vec, embed)
@@ -276,6 +294,44 @@ async def main():
         ids = [x.episode_id for x in r]
         assert e3 in ids, f"私聊应召回群聊'小雨感冒'，got {ids}"
         print(f"✓ 场景 2: 私聊召回群聊事件 ({ids})")
+
+        # 同一 query 在群聊/owner 私聊/非 owner 私聊下的可见性回归。
+        group = await retr.recall(
+            "插件报错", session_id="grp", chat_type="group",
+            group_id="g_main", current_speaker_id="222",
+        )
+        owner = await retr.recall(
+            "插件报错", session_id="priv_A", chat_type="private",
+            group_id=None, current_speaker_id=" 111 ",
+        )
+        non_owner = await retr.recall(
+            "插件报错", session_id="priv_B", chat_type="private",
+            group_id=None, current_speaker_id=222,
+        )
+        assert e2 in {x.episode_id for x in group}
+        assert e2 in {x.episode_id for x in owner}
+        assert e2 not in {x.episode_id for x in non_owner}
+        scope = retr.visibility_info("private", "priv_A", None, " 111 ")
+        assert scope["resolved_owner_id"] == "111"
+        assert scope["current_speaker_id"] == "111"
+        assert scope["is_owner"] is True
+        assert scope["visibility_scope"] == "private_session+all_groups"
+        assert retr.visibility_info("private", "priv_B", None, "222")["visibility_scope"] == "private_session_only"
+        panel_mod = importlib.import_module(f"{_PKG}.pipeline.panel")
+        panel = object.__new__(panel_mod.MemoirPanel)
+        panel.retriever = retr
+        async def owner_debug_body():
+            return dict(query="插件报错", chat_type="private", session_id="priv_A",
+                        current_speaker_id=111)
+        with patch.object(panel_mod, "_json_body", owner_debug_body):
+            debug = await panel.debug_recall()
+        assert debug["status"] == "ok"
+        assert debug["data"]["scope"]["resolved_owner_id"] == "111"
+        assert debug["data"]["scope"]["current_speaker_id"] == "111"
+        assert debug["data"]["scope"]["is_owner"] is True
+        assert debug["data"]["scope"]["visibility_scope"] == "private_session+all_groups"
+        assert e2 in {item["episode_id"] for item in debug["data"]["results"]}
+        print("✓ owner QQ 类型/空格归一化，私聊跨群与非 owner 隔离")
 
         ordinary = await retr.recall(
             "小雨怎么了", session_id="priv_B", chat_type="private",

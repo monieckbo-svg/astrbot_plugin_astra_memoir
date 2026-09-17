@@ -459,6 +459,7 @@ async function runDebugRecall() {
     let html = `<div class="card">
       <div style="font-size:12px;color:var(--muted)">query: ${escapeHtml(d.query)}</div>
       <div style="font-size:11px;color:var(--muted)">scope: ${escapeHtml(JSON.stringify(d.scope))}</div>
+      <div style="font-size:12px">resolved_owner_id: ${escapeHtml(d.scope.resolved_owner_id || '(未配置)')} · current_speaker_id: ${escapeHtml(d.scope.current_speaker_id || '(未填写)')} · is_owner: ${escapeHtml(d.scope.is_owner)} · visibility_scope: ${escapeHtml(d.scope.visibility_scope)}</div>
     </div>`;
     if (!results.length) {
       html += '<div class="empty">无命中（可能被 relevance gate 拦掉；或 group_id 缺失场景直接返回空）</div>';

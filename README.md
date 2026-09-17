@@ -64,7 +64,7 @@ git pull
 | `extract_provider_id` | 事件拆分 LLM provider ID（**强烈建议先建一个便宜快的 provider 如 DeepSeek Flash**，别用跟星星聊天的主 provider 抢配额） |
 | `embedding_provider_id` | 必须从已配置的 Embedding provider 中选择；插件会自动获取维度并补齐缺失向量 |
 
-如需在私聊召回群聊记忆，把 owner QQ 填入 `cross_group_owner_ids`；留空时私聊用户只能查自己的私聊记忆。
+如需在私聊召回群聊记忆，在插件配置中把 owner QQ 填入 `owner_qq_id` 并打开 `enable_group_recall_in_private`；留空时私聊用户只能查自己的私聊记忆。旧版的 `cross_group_owner_ids` 已不再读取，升级后请在新字段重新填写。
 
 其他可以先用默认。想调优时看：
 

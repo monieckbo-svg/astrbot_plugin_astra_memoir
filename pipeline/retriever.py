@@ -48,7 +48,7 @@ class RetrieverConfig:
     recency_half_life_days: float = 30.0
     # 私聊召回群聊事件的总开关
     enable_group_recall_in_private: bool = True
-    cross_group_owner_ids: frozenset[str] = frozenset()
+    owner_qq_id: str = ""
 
 
 @dataclass
@@ -108,17 +108,30 @@ class Retriever:
         返回 None 表示"当前场景无法安全召回"（如群聊拿不到 group_id）,
         retriever 应直接放弃本次召回。
         """
+        return self.visibility_info(chat_type, session_id, group_id,
+                                    current_speaker_id)["kwargs"]
+
+    def visibility_info(
+        self, chat_type: str, session_id: str, group_id: str | None,
+        current_speaker_id: str = "",
+    ) -> dict:
+        """返回检索实际使用的范围及可供面板诊断的 owner 信息。"""
+        owner = str(self.config.owner_qq_id or "").strip()
+        speaker = str(current_speaker_id or "").strip()
+        is_owner = bool(owner and speaker and speaker == owner)
+        info = dict(resolved_owner_id=owner, current_speaker_id=speaker,
+                    is_owner=is_owner, visibility_scope="none", kwargs=None)
         if chat_type == "private":
-            return dict(
-                include_session_id=session_id,
-                include_all_groups=(self.config.enable_group_recall_in_private
-                                    and current_speaker_id in self.config.cross_group_owner_ids),
+            cross_group = bool(self.config.enable_group_recall_in_private and is_owner)
+            info["visibility_scope"] = (
+                "private_session+all_groups" if cross_group else "private_session_only"
             )
-        # group
-        if group_id is None or not str(group_id).strip():
-            # 群聊拿不到 group_id → 绝不召回（否则会变成全库可见）
-            return None
-        return dict(include_group_id=group_id)
+            info["kwargs"] = dict(include_session_id=session_id,
+                                  include_all_groups=cross_group)
+        elif chat_type == "group" and group_id is not None and str(group_id).strip():
+            info["visibility_scope"] = "current_group_only"
+            info["kwargs"] = dict(include_group_id=group_id)
+        return info
 
     # ---------- 主入口 ----------
 

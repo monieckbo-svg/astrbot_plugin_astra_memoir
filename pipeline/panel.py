@@ -369,7 +369,7 @@ class MemoirPanel:
         chat_type = body.get("chat_type", "private")
         session_id = body.get("session_id", "debug_session")
         group_id = body.get("group_id") or None
-        current_speaker_id = str(body.get("current_speaker_id", ""))
+        current_speaker_id = str(body.get("current_speaker_id", "") or "").strip()
 
         if not query:
             return {"status": "error", "message": "missing query"}
@@ -386,6 +386,9 @@ class MemoirPanel:
             logger.exception("[Memoir] debug_recall 异常")
             return {"status": "error", "message": str(e)}
 
+        visibility = self.retriever.visibility_info(
+            chat_type, session_id, group_id, current_speaker_id,
+        )
         return {
             "status": "ok",
             "data": {
@@ -395,6 +398,9 @@ class MemoirPanel:
                     "session_id": session_id,
                     "group_id": group_id,
                     "current_speaker_id": current_speaker_id,
+                    "resolved_owner_id": visibility["resolved_owner_id"],
+                    "is_owner": visibility["is_owner"],
+                    "visibility_scope": visibility["visibility_scope"],
                 },
                 "results": [
                     {
