@@ -1,16 +1,14 @@
 """
 pipeline/scheduler.py — 后台调度器 + process_batch 主流程
 
-一个单独的 asyncio 长跑协程，每 N 秒扫一次"有未处理消息的活跃会话"，
-判断是否达到触发条件（数量阈值 / idle timeout）。
+改动（Phase 1f-fix）:
 
-per-session asyncio.Lock 保证同一会话同时只跑一次 process_batch，
-两个触发条件（数量 vs idle）走同一入口。
-
-process_batch 是整个 pipeline 的核心：
-  拉未处理 → 拉 overlap → LLM 拆事件 → 校验 → 落库 → 标 processed
-
-见 DESIGN §4、§5.4。
+- bounded batch: 数量触发时只拿最早 N 个（私聊 completed turn，群聊 inbound），
+  剩余留下一批；idle 触发时才把所有未处理（含未闭合 user）全部消化
+- extractor 失败（success=False）→ raw 保持 unprocessed，下次重试
+- extractor 成功但 events=[] → 在同一逻辑事务里标 processed（防死循环）
+- extractor 成功有 events → 走 writer.write_batch，写库+processed 一次原子完成
+- 后台 task 全部追踪，terminate 时收干净
 """
 from __future__ import annotations
 
@@ -22,7 +20,7 @@ from astrbot.api import logger
 
 from ..storage import MemoirDB
 from .extractor import EventExtractor
-from .writer import EpisodeWriter
+from .writer import EpisodeWriter, WriteBatchError
 
 
 @dataclass
@@ -38,14 +36,6 @@ class SchedulerConfig:
 
 
 class BatchScheduler:
-    """
-    后台调度器 + process_batch 主流程实现。
-
-    - start(): 起后台协程
-    - stop(): 停后台协程
-    - process_batch(session_id): 手动触发（也被 tick 调用）
-    """
-
     def __init__(
         self,
         db: MemoirDB,
@@ -58,33 +48,60 @@ class BatchScheduler:
         self.writer = writer
         self.config = config
 
-        self._task: asyncio.Task | None = None
+        self._main_task: asyncio.Task | None = None
         self._stop_evt = asyncio.Event()
-        # per-session lock，防止同一会话被同时触发两次
         self._session_locks: dict[str, asyncio.Lock] = {}
-        # TTL 上次跑时间
+        # 追踪所有后台 task，terminate 时收干净
+        self._background_tasks: set[asyncio.Task] = set()
         self._last_ttl_at: float = 0.0
 
     # ---------- 生命周期 ----------
 
     def start(self) -> None:
-        if self._task is not None:
+        if self._main_task is not None:
             return
         self._stop_evt.clear()
-        self._task = asyncio.create_task(self._run(), name="memoir-scheduler")
+        self._main_task = asyncio.create_task(self._run(), name="memoir-scheduler")
         logger.info("[Memoir] scheduler 已启动 (interval=%ds)", self.config.interval_seconds)
 
     async def stop(self) -> None:
-        if self._task is None:
-            return
         self._stop_evt.set()
-        try:
-            await asyncio.wait_for(self._task, timeout=5.0)
-        except asyncio.TimeoutError:
-            self._task.cancel()
-        finally:
-            self._task = None
-            logger.info("[Memoir] scheduler 已停止")
+        if self._main_task is not None:
+            try:
+                await asyncio.wait_for(self._main_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                self._main_task.cancel()
+                try:
+                    await self._main_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            finally:
+                self._main_task = None
+
+        # 等所有后台 batch task 收尾
+        if self._background_tasks:
+            logger.info(
+                "[Memoir] scheduler stop: waiting %d background task(s) to finish",
+                len(self._background_tasks),
+            )
+            done, pending = await asyncio.wait(
+                self._background_tasks, timeout=10.0,
+            )
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self._background_tasks.clear()
+
+        logger.info("[Memoir] scheduler 已停止")
+
+    def _spawn(self, coro, name: str) -> None:
+        """追踪 background task。"""
+        t = asyncio.create_task(coro, name=name)
+        self._background_tasks.add(t)
+        t.add_done_callback(self._background_tasks.discard)
 
     # ---------- 主循环 ----------
 
@@ -95,24 +112,15 @@ class BatchScheduler:
             except Exception:
                 logger.exception("[Memoir] scheduler tick 异常，继续下一轮")
 
-            # 可被 stop 中断的 sleep
             try:
                 await asyncio.wait_for(
-                    self._stop_evt.wait(),
-                    timeout=self.config.interval_seconds,
+                    self._stop_evt.wait(), timeout=self.config.interval_seconds,
                 )
-                return  # stop 被 set 了
+                return
             except asyncio.TimeoutError:
                 pass
 
     async def _tick(self) -> None:
-        """
-        每 interval 秒的动作：
-        1. 找所有有未处理消息的会话
-        2. 判断是否达到触发条件，达到就调 process_batch
-        3. 每天跑一次 TTL 清理
-        """
-        # 1. 找活跃会话
         def _find_active():
             return self.db.get_active_sessions_with_unprocessed()
 
@@ -127,7 +135,7 @@ class BatchScheduler:
             completed_user_turns = int(row["completed_user_turns"] or 0)
             group_inbound_count = int(row["group_inbound_count"] or 0)
 
-            triggered, reason = self._should_trigger(
+            triggered, mode, reason = self._should_trigger(
                 chat_type, now, last_at,
                 user_turn_count=user_turn_count,
                 completed_user_turns=completed_user_turns,
@@ -135,19 +143,17 @@ class BatchScheduler:
             )
             if triggered:
                 logger.info(
-                    "[Memoir] trigger process_batch: session=%s chat_type=%s reason=%s",
-                    session_id, chat_type, reason,
+                    "[Memoir] trigger process_batch: session=%s chat_type=%s mode=%s reason=%s",
+                    session_id, chat_type, mode, reason,
                 )
-                # 不 await，让不同 session 并行；per-session lock 由 process_batch 内部处理
-                asyncio.create_task(
-                    self.process_batch(session_id),
+                self._spawn(
+                    self.process_batch(session_id, mode=mode),
                     name=f"memoir-batch-{session_id[:16]}",
                 )
 
-        # 2. TTL: 每 24h 跑一次
         if now - self._last_ttl_at > 86400:
             self._last_ttl_at = now
-            asyncio.create_task(self._ttl_cleanup(), name="memoir-ttl")
+            self._spawn(self._ttl_cleanup(), name="memoir-ttl")
 
     def _should_trigger(
         self,
@@ -158,37 +164,33 @@ class BatchScheduler:
         user_turn_count: int,
         completed_user_turns: int,
         group_inbound_count: int,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, str]:
         """
-        判断是否达到触发条件。返回 (触发?, 原因)。
-
-        私聊 race 处理:
-          - 数量阈值检查用 completed_user_turns（已被 Astra 回复的 user 数）
-            避免"第 10 条 user 刚到，Astra 还在生成回复" 时把它纳入 batch，
-            导致 assistant reply 后落成孤 raw。
-          - idle 阈值检查用 user_turn_count（含未闭合的）
-            长时间没等到回复（异常/被拦）也允许消化，避免永远卡住。
+        判断是否触发。返回 (触发?, mode, 原因)。
+        mode: "threshold" | "idle"
         """
         idle_seconds = now - last_at
 
         if chat_type == "private":
             if completed_user_turns >= self.config.private_batch_user_turns:
-                return True, (
+                return True, "threshold", (
                     f"private completed_turns >= {self.config.private_batch_user_turns}"
                 )
             if idle_seconds >= self.config.private_idle_minutes * 60:
-                return True, (
+                return True, "idle", (
                     f"private idle {idle_seconds}s "
                     f"(user_turns={user_turn_count}, completed={completed_user_turns})"
                 )
         else:  # group
             if group_inbound_count >= self.config.group_batch_inbound:
-                return True, f"group inbound >= {self.config.group_batch_inbound}"
+                return True, "threshold", (
+                    f"group inbound >= {self.config.group_batch_inbound}"
+                )
             if idle_seconds >= self.config.group_idle_minutes * 60:
-                return True, f"group idle {idle_seconds}s"
-        return False, ""
+                return True, "idle", f"group idle {idle_seconds}s"
+        return False, "", ""
 
-    # ---------- process_batch 主流程 ----------
+    # ---------- process_batch ----------
 
     def _get_lock(self, session_id: str) -> asyncio.Lock:
         lock = self._session_locks.get(session_id)
@@ -197,87 +199,117 @@ class BatchScheduler:
             self._session_locks[session_id] = lock
         return lock
 
-    async def process_batch(self, session_id: str) -> None:
-        """
-        对指定 session 跑一次事件消化。
-
-        流程:
-        1. 取 per-session lock（拿不到直接返回，等下一轮）
-        2. 拉未处理 raw
-        3. 拉 overlap
-        4. LLM 拆事件（含硬规则校验）
-        5. 全部 events 落库（含 events=[] 场景）
-        6. 全部成功后标 processed
-           任一失败 → 保持 unprocessed，下次重试
-        """
+    async def process_batch(self, session_id: str, *, mode: str = "idle") -> None:
+        """对指定 session 跑一次事件消化。"""
         lock = self._get_lock(session_id)
         if lock.locked():
-            logger.debug("[Memoir] session %s 已在处理中，跳过本次触发", session_id)
+            logger.debug("[Memoir] session %s 已在处理中，跳过", session_id)
             return
 
         async with lock:
             try:
-                await self._process_batch_locked(session_id)
+                await self._process_batch_locked(session_id, mode)
             except Exception:
                 logger.exception(
-                    "[Memoir] process_batch 异常，session=%s，raw 保持 unprocessed", session_id,
+                    "[Memoir] process_batch 异常，session=%s，raw 保持 unprocessed",
+                    session_id,
                 )
 
-    async def _process_batch_locked(self, session_id: str) -> None:
-        # 1. 拉未处理 raw
-        def _load_new():
-            return self.db.get_unprocessed_by_session(session_id)
+    async def _process_batch_locked(self, session_id: str, mode: str) -> None:
+        # 1. 拉本批 new_msgs（bounded！）
+        batch_size = (
+            self.config.private_batch_user_turns
+            if mode == "threshold"
+            else 0  # idle 不看 batch_size
+        )
 
-        new_msgs = await self.db.run(_load_new)
+        def _load_batch():
+            # 需要先知道 chat_type 才能算 batch_size 对应字段
+            # 先看看 session 的类型
+            rows = self.db.get_unprocessed_by_session(session_id, limit=1)
+            if not rows:
+                return [], "private"
+            ct = rows[0]["chat_type"]
+            # bounded batch
+            bs = (
+                self.config.private_batch_user_turns if ct == "private"
+                else self.config.group_batch_inbound
+            )
+            return self.db.get_bounded_batch(
+                session_id, ct, mode=mode, batch_size=bs,
+            ), ct
+
+        new_msgs, chat_type = await self.db.run(_load_batch)
         if not new_msgs:
             return
 
-        chat_type = new_msgs[0]["chat_type"]
         group_id = new_msgs[0]["group_id"]
         platform = new_msgs[0]["platform"]
 
-        # 2. 拉 overlap（上一批已 processed 的最后 N 条）
+        # 2. overlap
         overlap_n = (
             self.config.overlap_group_messages if chat_type == "group"
             else self.config.overlap_private_messages
         )
-        overlap_msgs = await self.db.run(
-            lambda: self.db.fetchall(
+
+        def _load_overlap():
+            return self.db.fetchall(
                 "SELECT * FROM recent_messages "
                 "WHERE session_id = ? AND processed_at IS NOT NULL "
                 "ORDER BY created_at DESC LIMIT ?",
                 (session_id, overlap_n),
             )
-        )
-        # 反转成时间升序
-        overlap_msgs = list(reversed(overlap_msgs))
+        overlap_msgs = list(reversed(await self.db.run(_load_overlap)))
 
-        # 3. LLM 拆事件
-        events = await self.extractor.extract(new_msgs, overlap_msgs, chat_type)
+        # 3. extractor
+        result = await self.extractor.extract(new_msgs, overlap_msgs, chat_type)
 
-        # 4. 落库
-        ok, fail = await self.writer.write_events(
-            events,
-            session_id=session_id,
-            chat_type=chat_type,
-            group_id=group_id,
-            platform=platform,
-        )
-
-        # 5. 标 processed
-        #    只要 extractor 成功返回（可能是 []），本批就算处理过了。
-        #    单条 event 写入失败不影响标 processed —— 那部分内容我们已经无法恢复了，
-        #    强行重试反而会 duplicate。这是权衡：宁可丢一条也不重复。
         raw_ids = [int(m["id"]) for m in new_msgs]
-        processed_at = int(time.time())
-        await self.db.run(
-            lambda: self.db.mark_processed(raw_ids, processed_at)
-        )
 
-        logger.info(
-            "[Memoir] batch done: session=%s new=%d events_ok=%d events_fail=%d",
-            session_id, len(new_msgs), ok, fail,
-        )
+        # 4. 分支处理
+        if not result.success:
+            logger.warning(
+                "[Memoir] extract failed for session=%s: %s — raw 保持 unprocessed，下次重试",
+                session_id, result.error,
+            )
+            return  # 不 mark_processed
+
+        if not result.events:
+            # 合法的空结果 → 标 processed（防死循环）
+            logger.info(
+                "[Memoir] batch done: session=%s new=%d events=0 (nothing worth remembering)",
+                session_id, len(new_msgs),
+            )
+            processed_at = int(time.time())
+            await self.db.run(
+                lambda: self.db.mark_processed(raw_ids, processed_at)
+            )
+            return
+
+        # 5. 有事件 → writer 原子写入
+        try:
+            written = await self.writer.write_batch(
+                result.events,
+                raw_ids_to_mark=raw_ids,
+                session_id=session_id,
+                chat_type=chat_type,
+                group_id=group_id,
+                platform=platform,
+            )
+            logger.info(
+                "[Memoir] batch done: session=%s new=%d events=%d written=%d (rejected=%d)",
+                session_id, len(new_msgs), len(result.events), len(written),
+                result.rejected_count,
+            )
+        except WriteBatchError as e:
+            logger.error(
+                "[Memoir] write_batch failed: %s — raw 保持 unprocessed", e,
+            )
+            # 不 mark_processed
+        except Exception:
+            logger.exception(
+                "[Memoir] write_batch 异常 — raw 保持 unprocessed"
+            )
 
     # ---------- TTL ----------
 
@@ -289,5 +321,7 @@ class BatchScheduler:
 
         n = await self.db.run(_del)
         if n > 0:
-            logger.info("[Memoir] TTL: 清理过期原文 %d 条 (retention=%d days)",
-                        n, self.config.raw_retention_days)
+            logger.info(
+                "[Memoir] TTL: 清理过期原文 %d 条 (retention=%d days)",
+                n, self.config.raw_retention_days,
+            )

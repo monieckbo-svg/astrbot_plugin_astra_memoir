@@ -27,6 +27,8 @@ from .pipeline import (
     SchedulerConfig,
     Retriever,
     RetrieverConfig,
+    MemoirPanel,
+    register_panel_routes,
 )
 
 
@@ -87,6 +89,13 @@ class AstraMemoir(Star):
         self.retriever = Retriever(
             context, self.db, self.vec, retr_cfg, embedding_provider_id
         )
+
+        # ---- 装配管理面板 + 注册 HTTP endpoint ----
+        self.panel = MemoirPanel(self.db, self.vec, self.retriever, self.scheduler)
+        try:
+            register_panel_routes(context, self.panel)
+        except Exception:
+            logger.exception("[Memoir] 面板路由注册失败，其他功能不受影响")
 
         # ---- 起后台调度 ----
         self.scheduler.start()

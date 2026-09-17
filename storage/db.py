@@ -70,12 +70,16 @@ class MemoirDB:
         schema_sql = _SCHEMA_SQL_PATH.read_text(encoding="utf-8")
         conn.executescript(schema_sql)
 
-        # 创建 vec0 虚拟表（在 python 里创建，因为需要动态填入 embedding_dim）
+        # 创建 vec0 虚拟表（含 metadata 列用于 KNN 阶段可见性过滤）
+        # sqlite-vec v0.1.6+ 支持 metadata columns
         conn.execute(
             f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS episode_vec USING vec0(
-                episode_id INTEGER PRIMARY KEY,
-                embedding FLOAT[{self.embedding_dim}] distance_metric=cosine
+                episode_id  INTEGER PRIMARY KEY,
+                chat_type   TEXT,
+                session_id  TEXT,
+                group_id    TEXT,
+                embedding   FLOAT[{self.embedding_dim}] distance_metric=cosine
             )
             """
         )
@@ -137,10 +141,11 @@ class MemoirDB:
     async def run(self, func, *args, **kwargs) -> Any:
         """
         用 asyncio.to_thread 包装一次同步操作。
-        典型用法：
-            await db.run(lambda: db.fetchall("SELECT ..."))
+        用 self._lock 串行化：SQLite 单连接不适合并发，
+        per-session lock 在 scheduler 层管，DB 层再上一道保险。
         """
-        return await asyncio.to_thread(func, *args, **kwargs)
+        async with self._lock:
+            return await asyncio.to_thread(func, *args, **kwargs)
 
     # ---------- 常用查询封装 ----------
 
@@ -212,6 +217,90 @@ class MemoirDB:
             sql += " LIMIT ?"
             params.append(limit)
         return self.fetchall(sql, tuple(params))
+
+    def get_bounded_batch(
+        self, session_id: str, chat_type: str,
+        *, mode: str, batch_size: int,
+    ) -> list[sqlite3.Row]:
+        """
+        按 mode 拿一批未处理消息，避免一次把长队列全塞给 LLM。
+
+        mode:
+        - "threshold":
+            私聊 → 最早 N 个 completed user turn（有 assistant reply）+ 它们的 assistant
+                   trailing 未闭合的 user 留下一批
+            群聊 → 最早 N 条 inbound 群消息 + 时间区间内 Astra 的回复
+        - "idle":
+            私聊 / 群聊 → 拉所有未处理（包括未闭合的 user）
+                          消化完就重置
+
+        私聊 threshold 关键：不把最后一条还没等到 assistant reply 的 user 纳入 batch。
+        """
+        if mode == "idle":
+            return self.get_unprocessed_by_session(session_id)
+
+        if chat_type == "private":
+            # 找最早 batch_size 个 completed user turn 的 id
+            completed_ids_rows = self.fetchall(
+                """
+                SELECT u.id, u.created_at
+                FROM recent_messages u
+                WHERE u.session_id = ?
+                  AND u.role = 'user'
+                  AND u.processed_at IS NULL
+                  AND EXISTS (
+                      SELECT 1 FROM recent_messages a
+                      WHERE a.trigger_raw_id = u.id
+                        AND a.role = 'assistant'
+                  )
+                ORDER BY u.created_at ASC
+                LIMIT ?
+                """,
+                (session_id, batch_size),
+            )
+            if not completed_ids_rows:
+                return []
+            user_ids = [r["id"] for r in completed_ids_rows]
+            # 拉这些 user + 它们的 assistant
+            placeholders = ",".join("?" * len(user_ids))
+            return self.fetchall(
+                f"""
+                SELECT * FROM recent_messages
+                WHERE session_id = ?
+                  AND processed_at IS NULL
+                  AND (
+                      id IN ({placeholders})
+                      OR trigger_raw_id IN ({placeholders})
+                  )
+                ORDER BY created_at ASC
+                """,
+                tuple([session_id, *user_ids, *user_ids]),
+            )
+
+        # group threshold: 最早 batch_size 条 inbound + 时间区间内 assistant
+        inbound_rows = self.fetchall(
+            """
+            SELECT id, created_at FROM recent_messages
+            WHERE session_id = ? AND processed_at IS NULL
+              AND role = 'user' AND chat_type = 'group'
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (session_id, batch_size),
+        )
+        if not inbound_rows:
+            return []
+        first_ts = inbound_rows[0]["created_at"]
+        last_ts = inbound_rows[-1]["created_at"]
+        return self.fetchall(
+            """
+            SELECT * FROM recent_messages
+            WHERE session_id = ? AND processed_at IS NULL
+              AND created_at >= ? AND created_at <= ?
+            ORDER BY created_at ASC
+            """,
+            (session_id, first_ts, last_ts),
+        )
 
     def get_active_sessions_with_unprocessed(self) -> list[sqlite3.Row]:
         """

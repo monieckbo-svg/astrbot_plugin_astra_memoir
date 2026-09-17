@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Memoir 面板</title>
+<style>
+  :root {
+    --bg: #fafafa;
+    --panel: #fff;
+    --border: #e5e5e5;
+    --text: #222;
+    --muted: #888;
+    --accent: #6f5b3e;
+    --tag-private: #e6f3ff;
+    --tag-group: #fff5e6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1a1a1a; --panel: #242424; --border: #333;
+      --text: #ddd; --muted: #888; --accent: #d4b896;
+      --tag-private: #1e3a5f; --tag-group: #5a3d1e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 14px/1.5 system-ui, -apple-system, sans-serif;
+    color: var(--text); background: var(--bg);
+  }
+  header {
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    background: var(--panel); display: flex; align-items: center; gap: 12px;
+  }
+  header h1 { margin: 0; font-size: 15px; font-weight: 600; }
+  nav { display: flex; gap: 4px; }
+  nav button {
+    padding: 6px 12px; border: 1px solid var(--border); background: transparent;
+    color: var(--text); border-radius: 4px; cursor: pointer; font-size: 13px;
+  }
+  nav button.active { background: var(--accent); color: white; border-color: var(--accent); }
+  main { padding: 16px; max-width: 1000px; margin: 0 auto; }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 14px; margin-bottom: 12px;
+  }
+  .stats-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px; margin-bottom: 16px;
+  }
+  .stat {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 12px;
+  }
+  .stat .n { font-size: 22px; font-weight: 600; color: var(--accent); }
+  .stat .label { font-size: 12px; color: var(--muted); }
+
+  .tag {
+    display: inline-block; padding: 2px 8px; border-radius: 3px;
+    font-size: 11px; margin-right: 4px;
+  }
+  .tag-private { background: var(--tag-private); }
+  .tag-group { background: var(--tag-group); }
+
+  .ep-title { font-weight: 600; margin-bottom: 4px; }
+  .ep-meta { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .ep-content { white-space: pre-wrap; margin-bottom: 6px; }
+  .ep-parts { font-size: 12px; color: var(--muted); }
+
+  details { margin-top: 8px; font-size: 12px; }
+  details summary { cursor: pointer; color: var(--muted); }
+  details pre {
+    background: var(--bg); padding: 8px; border-radius: 4px;
+    overflow-x: auto; font-size: 11px;
+  }
+
+  input, select, textarea, button {
+    font-family: inherit; font-size: 13px;
+    padding: 6px 10px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); border-radius: 4px;
+  }
+  input:focus, select:focus, textarea:focus {
+    outline: none; border-color: var(--accent);
+  }
+  .toolbar {
+    display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap;
+  }
+  .toolbar > * { flex-shrink: 0; }
+  .toolbar input[type=search] { flex-grow: 1; min-width: 180px; }
+
+  table {
+    width: 100%; border-collapse: collapse; font-size: 12px;
+    background: var(--panel);
+  }
+  th, td {
+    padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border);
+  }
+  th { color: var(--muted); font-weight: 500; }
+  td.small { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .badge-processed { color: green; font-size: 11px; }
+  .badge-unprocessed { color: orange; font-size: 11px; }
+
+  .empty { color: var(--muted); text-align: center; padding: 20px; font-size: 13px; }
+  .loading { color: var(--muted); padding: 12px; font-size: 12px; }
+  .error { color: #c33; padding: 10px; border: 1px solid #c33; border-radius: 4px; margin: 10px 0; }
+
+  #debug .result-row { border-bottom: 1px solid var(--border); padding: 8px 0; }
+  #debug .result-scores {
+    font-family: monospace; font-size: 11px; color: var(--muted); margin-top: 4px;
+  }
+
+  #detail .raw-msg {
+    padding: 6px 10px; border-left: 3px solid var(--border); margin-bottom: 4px;
+    font-size: 12px;
+  }
+  #detail .raw-msg.assistant { border-left-color: var(--accent); background: rgba(0,0,0,0.02); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>📖 Memoir 面板</h1>
+  <nav>
+    <button data-tab="stats" class="active">状态</button>
+    <button data-tab="episodes">Episodes</button>
+    <button data-tab="raw">近期原文</button>
+    <button data-tab="debug">检索调试</button>
+  </nav>
+</header>
+
+<main>
+  <div id="stats" class="tab-content">
+    <div class="stats-grid" id="statsGrid"><div class="loading">加载中…</div></div>
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:8px">活跃 session（有未处理消息）</div>
+      <div id="activeSessions"><div class="loading">加载中…</div></div>
+    </div>
+  </div>
+
+  <div id="episodes" class="tab-content" hidden>
+    <div class="toolbar">
+      <select id="epChatType">
+        <option value="">全部类型</option>
+        <option value="private">私聊</option>
+        <option value="group">群聊</option>
+      </select>
+      <input type="search" id="epSearch" placeholder="搜索标题/内容/关键词（FTS）">
+      <input type="text" id="epParticipant" placeholder="Participant QQ" style="width: 120px">
+      <button onclick="loadEpisodes()">筛选</button>
+    </div>
+    <div id="episodesList"><div class="loading">加载中…</div></div>
+  </div>
+
+  <div id="detail" class="tab-content" hidden>
+    <button onclick="showTab('episodes')">← 返回列表</button>
+    <div id="detailContent" style="margin-top:12px"><div class="loading">加载中…</div></div>
+  </div>
+
+  <div id="raw" class="tab-content" hidden>
+    <div class="toolbar">
+      <select id="rawChatType">
+        <option value="">全部类型</option>
+        <option value="private">私聊</option>
+        <option value="group">群聊</option>
+      </select>
+      <select id="rawRole">
+        <option value="">全部角色</option>
+        <option value="user">user</option>
+        <option value="assistant">assistant</option>
+      </select>
+      <select id="rawProcessed">
+        <option value="">全部状态</option>
+        <option value="false">未处理</option>
+        <option value="true">已处理</option>
+      </select>
+      <input type="text" id="rawSession" placeholder="session_id" style="width: 200px">
+      <button onclick="loadRaw()">筛选</button>
+    </div>
+    <div id="rawTableWrap"><div class="loading">加载中…</div></div>
+  </div>
+
+  <div id="debug" class="tab-content" hidden>
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:8px">模拟检索</div>
+      <textarea id="dbgQuery" placeholder="测试查询：小雨昨天怎么了？" style="width:100%;min-height:60px" rows="3"></textarea>
+      <div class="toolbar" style="margin-top:8px">
+        <select id="dbgChatType">
+          <option value="private">私聊场景</option>
+          <option value="group">群聊场景</option>
+        </select>
+        <input type="text" id="dbgSession" placeholder="session_id" value="debug_session" style="width: 200px">
+        <input type="text" id="dbgGroupId" placeholder="群聊场景填 group_id" style="width: 160px">
+        <input type="text" id="dbgSpeaker" placeholder="当前 speaker QQ" style="width: 160px">
+        <button onclick="runDebugRecall()">运行</button>
+      </div>
+    </div>
+    <div id="dbgResults"></div>
+  </div>
+</main>
+
+<script>
+// ============ Bridge ============
+let bridgeReady = false;
+const bridge = window.astrbotPluginPageBridge || null;
+
+function api(path, params) {
+  if (!bridge) return Promise.reject(new Error('bridge not loaded'));
+  return bridge.apiGet(path, params);
+}
+function apiPost(path, body) {
+  return bridge.apiPost(path, body);
+}
+
+// ============ Tab 切换 ============
+function showTab(name) {
+  document.querySelectorAll('.tab-content').forEach(el => el.hidden = true);
+  document.getElementById(name).hidden = false;
+  document.querySelectorAll('nav button').forEach(b => {
+    b.classList.toggle('active', b.dataset.tab === name);
+  });
+  if (name === 'stats') loadStats();
+  if (name === 'episodes') loadEpisodes();
+  if (name === 'raw') loadRaw();
+}
+document.querySelectorAll('nav button').forEach(b => {
+  b.onclick = () => showTab(b.dataset.tab);
+});
+
+// ============ Stats ============
+async function loadStats() {
+  const grid = document.getElementById('statsGrid');
+  const sess = document.getElementById('activeSessions');
+  grid.innerHTML = '<div class="loading">加载中…</div>';
+  try {
+    const r = await api('/stats');
+    const d = r.data || r;
+    const items = [
+      ['Episode 总数', d.episodes_total],
+      ['今日新增', d.episodes_today],
+      ['Raw 总数', d.raw_total],
+      ['Raw 未处理', d.raw_unprocessed],
+      ['缺失向量', d.vec_missing],
+      ['调度器', d.scheduler_running ? '运行中' : '停止'],
+    ];
+    grid.innerHTML = items.map(([label, n]) =>
+      `<div class="stat"><div class="n">${n}</div><div class="label">${label}</div></div>`
+    ).join('');
+
+    if (d.last_extracted_at) {
+      const dt = new Date(d.last_extracted_at * 1000).toLocaleString();
+      grid.insertAdjacentHTML('beforeend',
+        `<div class="stat"><div style="font-size:13px;font-weight:600">${dt}</div><div class="label">最近一次成功提取</div></div>`
+      );
+    }
+
+    if (d.active_sessions && d.active_sessions.length) {
+      sess.innerHTML = '<table><thead><tr><th>session</th><th>类型</th><th>群号</th><th>未处理</th></tr></thead><tbody>'
+        + d.active_sessions.map(s =>
+          `<tr><td class="small">${escapeHtml(s.session_id)}</td><td>${s.chat_type}</td><td>${s.group_id || '-'}</td><td>${s.unprocessed_count}</td></tr>`
+        ).join('') + '</tbody></table>';
+    } else {
+      sess.innerHTML = '<div class="empty">无未处理消息</div>';
+    }
+  } catch (e) {
+    grid.innerHTML = `<div class="error">${e.message}</div>`;
+  }
+}
+
+// ============ Episodes 列表 ============
+async function loadEpisodes() {
+  const wrap = document.getElementById('episodesList');
+  wrap.innerHTML = '<div class="loading">加载中…</div>';
+  const params = {};
+  const ct = document.getElementById('epChatType').value;
+  const q = document.getElementById('epSearch').value.trim();
+  const pt = document.getElementById('epParticipant').value.trim();
+  if (ct) params.chat_type = ct;
+  if (q) params.q = q;
+  if (pt) params.participant = pt;
+  try {
+    const r = await api('/episodes', params);
+    const eps = r.data || [];
+    if (!eps.length) {
+      wrap.innerHTML = '<div class="empty">没有匹配的 episode</div>';
+      return;
+    }
+    wrap.innerHTML = eps.map(ep => {
+      const dt = new Date(ep.event_start_at * 1000).toLocaleString();
+      const parts = (ep.participants || []).map(p => p.speaker_name).join('、') || '-';
+      const tag = ep.chat_type === 'group' ? 'tag-group' : 'tag-private';
+      const tagLabel = ep.chat_type === 'group' ? '群聊' : '私聊';
+      return `<div class="card" onclick="loadDetail(${ep.id})" style="cursor:pointer">
+        <div class="ep-title"><span class="tag ${tag}">${tagLabel}</span>${escapeHtml(ep.title)}</div>
+        <div class="ep-meta">${dt} · #${ep.id}</div>
+        <div class="ep-content">${escapeHtml(ep.content)}</div>
+        <div class="ep-parts">参与者：${escapeHtml(parts)}</div>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    wrap.innerHTML = `<div class="error">${e.message}</div>`;
+  }
+}
+
+// ============ Episode Detail ============
+async function loadDetail(id) {
+  showTab('detail');
+  const c = document.getElementById('detailContent');
+  c.innerHTML = '<div class="loading">加载中…</div>';
+  try {
+    const r = await api(`/episodes/${id}`);
+    const ep = r.data;
+    if (!ep) { c.innerHTML = '<div class="error">episode 不存在</div>'; return; }
+    const dt = new Date(ep.event_start_at * 1000).toLocaleString();
+    const tag = ep.chat_type === 'group' ? 'tag-group' : 'tag-private';
+    const tagLabel = ep.chat_type === 'group' ? '群聊' : '私聊';
+    const parts = (ep.participants || []).map(p =>
+      `<span class="tag">${escapeHtml(p.speaker_name)}${p.role==='assistant' ? ' (Astra)' : ''}</span>`
+    ).join('');
+    const kw = (ep.keywords || []).map(k => `<span class="tag">${escapeHtml(k)}</span>`).join('');
+
+    let evidenceHtml = '';
+    if (ep.raw_evidence && ep.raw_evidence.length) {
+      evidenceHtml = ep.raw_evidence.map(r => {
+        const t = new Date(r.created_at * 1000).toLocaleTimeString();
+        const cls = r.role === 'assistant' ? 'raw-msg assistant' : 'raw-msg';
+        return `<div class="${cls}"><span style="color:var(--muted)">${t}</span> <b>${escapeHtml(r.speaker_name)}</b>: ${escapeHtml(r.content)}</div>`;
+      }).join('');
+    } else {
+      evidenceHtml = '<div class="empty">原始消息已按保留策略清理</div>';
+    }
+    if (ep.raw_missing_ids && ep.raw_missing_ids.length) {
+      evidenceHtml += `<div class="empty">${ep.raw_missing_ids.length} 条原始消息已被清理</div>`;
+    }
+
+    c.innerHTML = `
+      <div class="card">
+        <div class="ep-title" style="font-size:18px">
+          <span class="tag ${tag}">${tagLabel}</span>${escapeHtml(ep.title)}
+        </div>
+        <div class="ep-meta">${dt}</div>
+        <div class="ep-content" style="margin: 10px 0">${escapeHtml(ep.content)}</div>
+        <div>参与者：${parts || '<span class="empty">无</span>'}</div>
+        ${kw ? '<div style="margin-top:6px">关键词：' + kw + '</div>' : ''}
+      </div>
+      <details open>
+        <summary style="font-weight:600;font-size:13px">▸ 原始证据（${ep.raw_evidence ? ep.raw_evidence.length : 0} 条）</summary>
+        <div style="margin-top:10px">${evidenceHtml}</div>
+      </details>
+      <details>
+        <summary style="font-weight:600;font-size:13px">▸ 技术信息</summary>
+        <pre>${escapeHtml(JSON.stringify({
+          episode_id: ep.id,
+          source_raw_ids: JSON.parse(ep.source_raw_ids || '[]'),
+          session_id: ep.session_id,
+          group_id: ep.group_id,
+          extracted_at: ep.extracted_at,
+          vec_present: ep.vec_present,
+          participants_full: ep.participants,
+        }, null, 2))}</pre>
+      </details>
+    `;
+  } catch (e) {
+    c.innerHTML = `<div class="error">${e.message}</div>`;
+  }
+}
+
+// ============ Recent Raw ============
+async function loadRaw() {
+  const wrap = document.getElementById('rawTableWrap');
+  wrap.innerHTML = '<div class="loading">加载中…</div>';
+  const params = {};
+  const ct = document.getElementById('rawChatType').value;
+  const r_ = document.getElementById('rawRole').value;
+  const pr = document.getElementById('rawProcessed').value;
+  const s = document.getElementById('rawSession').value.trim();
+  if (ct) params.chat_type = ct;
+  if (r_) params.role = r_;
+  if (pr) params.processed = pr;
+  if (s) params.session_id = s;
+  try {
+    const r = await api('/raw', params);
+    const rows = r.data || [];
+    if (!rows.length) {
+      wrap.innerHTML = '<div class="empty">没有匹配</div>';
+      return;
+    }
+    wrap.innerHTML = '<table><thead><tr><th>id</th><th>时间</th><th>类型</th><th>角色</th><th>speaker</th><th>content</th><th>trigger</th><th>processed</th></tr></thead><tbody>'
+      + rows.map(r => {
+        const t = new Date(r.created_at * 1000).toLocaleString();
+        const badge = r.processed_at
+          ? '<span class="badge-processed">✓</span>'
+          : '<span class="badge-unprocessed">·</span>';
+        return `<tr>
+          <td>${r.id}</td><td>${t}</td>
+          <td>${r.chat_type}</td><td>${r.role}</td>
+          <td>${escapeHtml(r.speaker_name)}</td>
+          <td class="small">${escapeHtml(r.content)}</td>
+          <td>${r.trigger_raw_id || '-'}</td>
+          <td>${badge}</td>
+        </tr>`;
+      }).join('') + '</tbody></table>';
+  } catch (e) {
+    wrap.innerHTML = `<div class="error">${e.message}</div>`;
+  }
+}
+
+// ============ Debug Recall ============
+async function runDebugRecall() {
+  const wrap = document.getElementById('dbgResults');
+  wrap.innerHTML = '<div class="loading">检索中…</div>';
+  const body = {
+    query: document.getElementById('dbgQuery').value.trim(),
+    chat_type: document.getElementById('dbgChatType').value,
+    session_id: document.getElementById('dbgSession').value.trim(),
+    group_id: document.getElementById('dbgGroupId').value.trim(),
+    current_speaker_id: document.getElementById('dbgSpeaker').value.trim(),
+  };
+  if (!body.query) {
+    wrap.innerHTML = '<div class="error">请填写 query</div>'; return;
+  }
+  try {
+    const r = await apiPost('/debug/recall', body);
+    const d = r.data;
+    const results = d.results || [];
+    let html = `<div class="card">
+      <div style="font-size:12px;color:var(--muted)">query: ${escapeHtml(d.query)}</div>
+      <div style="font-size:11px;color:var(--muted)">scope: ${escapeHtml(JSON.stringify(d.scope))}</div>
+    </div>`;
+    if (!results.length) {
+      html += '<div class="empty">无命中（可能被 relevance gate 拦掉；或 group_id 缺失场景直接返回空）</div>';
+    } else {
+      html += results.map((res, i) => {
+        const dt = new Date(res.event_start_at * 1000).toLocaleString();
+        const tag = res.chat_type === 'group' ? 'tag-group' : 'tag-private';
+        const tagLabel = res.chat_type === 'group' ? '群聊' : '私聊';
+        const vec = res.vec_distance !== null && res.vec_distance !== undefined
+          ? `vec_dist=${res.vec_distance.toFixed(4)}` : 'vec=none';
+        return `<div class="card result-row">
+          <div class="ep-title">
+            #${i + 1} <span class="tag ${tag}">${tagLabel}</span>${escapeHtml(res.title)}
+          </div>
+          <div class="ep-meta">${dt} · id=${res.episode_id}</div>
+          <div class="ep-content">${escapeHtml(res.content)}</div>
+          <div class="ep-parts">参与者：${escapeHtml(res.participants.join('、'))}</div>
+          <div class="result-scores">${vec} · fts_hit=${res.fts_hit} · rrf=${res.rrf_score.toFixed(4)}</div>
+        </div>`;
+      }).join('');
+    }
+    wrap.innerHTML = html;
+  } catch (e) {
+    wrap.innerHTML = `<div class="error">${e.message}</div>`;
+  }
+}
+
+// ============ Utils ============
+function escapeHtml(s) {
+  if (s === null || s === undefined) return '';
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ============ Boot ============
+(async function boot() {
+  if (!bridge) {
+    document.querySelector('main').innerHTML = '<div class="error">Plugin bridge SDK 未加载</div>';
+    return;
+  }
+  await bridge.ready();
+  loadStats();
+})();
+</script>
+</body>
+</html>

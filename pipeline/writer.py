@@ -1,14 +1,19 @@
 """
 pipeline/writer.py — 事件落库
 
-对每个通过校验的 ExtractedEvent：
-1. 从 source_raw_ids 回查参与者（participants 由代码回查，不听 LLM）
-2. 生成 embedding
-3. 单个 transaction 里写 episode + participants + keywords + FTS
-4. transaction 外写 vec（vec0 不支持事务嵌套）
-5. 全部成功 → 由 scheduler 统一 mark_processed；任一失败抛异常 → raw 保持 unprocessed
+改动（Phase 1f-fix，恢复 DESIGN §5.4）:
 
-见 DESIGN §5.4。
+一次 write_batch 的流程:
+1. 从 source_raw_ids 回查 raws，二次校验（session_id 匹配 + row 数 = ids 数）
+2. 批量生成整批 events 的 embedding
+3. 单个 SQLite transaction 里写：
+       episodes → participants → keywords → FTS → mark_processed(raws)
+4. transaction commit 后，逐条写 vec:
+       vec 写失败**不删除 episode** —— SQLite 是真库，vec 是可重建索引
+       后续 reindex 可以补齐（VecStore.missing_episode_ids）
+
+也就是说，events 落库和 raw processed 是一体事务。events=[] 也应该原子标 processed，
+这一步由 scheduler 处理（本模块不管；本模块的 mark_processed 只处理有事件的情况）。
 """
 from __future__ import annotations
 
@@ -19,6 +24,11 @@ from astrbot.api.star import Context
 
 from ..storage import MemoirDB, VecStore
 from .extractor import ExtractedEvent
+
+
+class WriteBatchError(Exception):
+    """整批写入失败，raw 保持 unprocessed。"""
+    pass
 
 
 class EpisodeWriter:
@@ -39,10 +49,6 @@ class EpisodeWriter:
     # ---------- Embedding ----------
 
     def _get_embedding_provider(self):
-        """
-        - 有配 embedding_provider_id 且能匹配 → 用它
-        - 否则用第一个可用的 embedding provider
-        """
         if self.embedding_provider_id:
             for prov in self.context.get_all_embedding_providers():
                 if getattr(prov, "id", None) == self.embedding_provider_id:
@@ -55,7 +61,6 @@ class EpisodeWriter:
         return providers[0] if providers else None
 
     async def _embed(self, text: str) -> list[float] | None:
-        """生成 embedding，失败返回 None。"""
         prov = self._get_embedding_provider()
         if prov is None:
             logger.error("[Memoir] 没有可用的 embedding provider")
@@ -66,151 +71,139 @@ class EpisodeWriter:
             logger.exception("[Memoir] embedding 生成失败")
             return None
 
-    # ---------- Main write ----------
+    # ---------- write_batch ----------
 
-    async def write_events(
+    async def write_batch(
         self,
         events: list[ExtractedEvent],
+        raw_ids_to_mark: list[int],
         *,
         session_id: str,
         chat_type: str,
         group_id: str | None,
         platform: str,
-    ) -> tuple[int, int]:
+    ) -> list[int]:
         """
-        写入所有 events。返回 (成功条数, 失败条数)。
+        原子写入一整批事件 + 标 raw processed。
 
-        events=[] 是合法的（无值得记忆的事件）—— 直接返回 (0, 0)。
-        单条失败不影响其他条；由 scheduler 决定是否整批回滚。
+        返回新写入的 episode_id 列表。
+        任一步失败 → 抛 WriteBatchError，scheduler 不 mark_processed 走重试。
+
+        events=[] 时**不调用本方法**（scheduler 直接标 processed），
+        本方法专门处理"有事件"的情况。
         """
         if not events:
-            return (0, 0)
+            raise WriteBatchError("write_batch called with empty events; scheduler should handle events=[] directly")
 
-        ok = 0
-        fail = 0
+        # 1. 从 source_raw_ids 回查 raws（一次拉齐），二次校验
+        all_source_ids = sorted({rid for ev in events for rid in ev.source_raw_ids})
+
+        def _load_raws():
+            placeholders = ",".join("?" * len(all_source_ids))
+            return self.db.fetchall(
+                f"SELECT id, session_id, speaker_id, speaker_name, role, created_at "
+                f"FROM recent_messages WHERE id IN ({placeholders})",
+                all_source_ids,
+            )
+        raws = await self.db.run(_load_raws)
+
+        if len(raws) != len(all_source_ids):
+            found = {r["id"] for r in raws}
+            missing = [i for i in all_source_ids if i not in found]
+            raise WriteBatchError(
+                f"source_raw_ids not found in recent_messages: {missing}"
+            )
+
+        # 二次校验：所有 source raw 必须属于本 session（防幻觉跨 session）
+        wrong_session = [
+            r["id"] for r in raws if r["session_id"] != session_id
+        ]
+        if wrong_session:
+            raise WriteBatchError(
+                f"source_raw_ids belong to other session, refused: {wrong_session}"
+            )
+
+        raws_by_id = {r["id"]: r for r in raws}
+
+        # 2. 批量生成 embedding（并发）
+        import asyncio
+        embed_tasks = [
+            self._embed(f"{ev.title}\n{ev.content}") for ev in events
+        ]
+        embeddings = await asyncio.gather(*embed_tasks, return_exceptions=False)
+
+        # 至少一个失败 → 不落库（避免半推半就的批次）
+        # V1 保守：全部成功才落
+        if any(e is None for e in embeddings):
+            failed_idx = [i for i, e in enumerate(embeddings) if e is None]
+            raise WriteBatchError(
+                f"embedding failed for event indices: {failed_idx}"
+            )
+
+        # 3. 单 transaction: episodes + participants + keywords + FTS + mark_processed
+        extracted_at = int(time.time())
+        prepared: list[dict] = []  # 每个 event 的 participants + times
         for ev in events:
-            try:
-                await self._write_one(
-                    ev,
-                    session_id=session_id,
-                    chat_type=chat_type,
-                    group_id=group_id,
-                    platform=platform,
+            ev_raws = [raws_by_id[i] for i in ev.source_raw_ids]
+            parts_map: dict[str, dict] = {}
+            for r in ev_raws:
+                sid = str(r["speaker_id"])
+                parts_map[sid] = {
+                    "speaker_id": sid,
+                    "speaker_name": r["speaker_name"],
+                    "role": r["role"],
+                }
+            participants = list(parts_map.values())
+            times = [int(r["created_at"]) for r in ev_raws]
+            prepared.append({
+                "participants": participants,
+                "event_start_at": min(times),
+                "event_end_at": max(times),
+            })
+
+        def _tx_write():
+            written_ids: list[int] = []
+            with self.db.transaction():
+                for ev, pp in zip(events, prepared):
+                    eid = self.db.insert_episode(
+                        platform=platform,
+                        chat_type=chat_type,
+                        session_id=session_id,
+                        group_id=group_id,
+                        title=ev.title,
+                        content=ev.content,
+                        source_raw_ids=ev.source_raw_ids,
+                        event_start_at=pp["event_start_at"],
+                        event_end_at=pp["event_end_at"],
+                        extracted_at=extracted_at,
+                    )
+                    self.db.insert_participants(eid, pp["participants"])
+                    self.db.insert_keywords(eid, ev.keywords)
+                    self.db.insert_fts(eid, ev.title, ev.content, ev.keywords)
+                    written_ids.append(eid)
+                # 同一 transaction 里标 raw processed
+                self.db.mark_processed(raw_ids_to_mark, extracted_at)
+            return written_ids
+
+        episode_ids = await self.db.run(_tx_write)
+
+        # 4. transaction 外写 vec —— 失败不删 episode
+        for eid, ev, emb in zip(episode_ids, events, embeddings):
+            def _vec_upsert(eid=eid, emb=emb):
+                self.vec.upsert(
+                    eid, emb,
+                    chat_type=chat_type, session_id=session_id, group_id=group_id,
                 )
-                ok += 1
+            try:
+                await self.db.run(_vec_upsert)
             except Exception:
                 logger.exception(
-                    "[Memoir] 写入 episode 失败，跳过: title=%r", ev.title,
+                    "[Memoir] vec upsert failed for episode %d — episode 保留，可用 reindex 后补",
+                    eid,
                 )
-                fail += 1
-        return (ok, fail)
 
-    async def _write_one(
-        self,
-        ev: ExtractedEvent,
-        *,
-        session_id: str,
-        chat_type: str,
-        group_id: str | None,
-        platform: str,
-    ) -> int:
-        """
-        写一条 event。返回 episode_id。
-
-        流程:
-        1. 回查 participants + 时间边界（在 SQL 层）
-        2. 生成 embedding（异步；vec 插入需要 embedding）
-        3. transaction 里: episode + participants + keywords + FTS
-        4. transaction 外: vec upsert
-        """
-        # --- 1. 回查 source raw 的元信息（participants + 时间）---
-        def _load_raws():
-            placeholders = ",".join("?" * len(ev.source_raw_ids))
-            rows = self.db.fetchall(
-                f"SELECT id, speaker_id, speaker_name, role, created_at "
-                f"FROM recent_messages WHERE id IN ({placeholders})",
-                ev.source_raw_ids,
-            )
-            return rows
-
-        raws = await self.db.run(_load_raws)
-        if not raws:
-            raise RuntimeError(
-                f"source_raw_ids 全部找不到 raw row: {ev.source_raw_ids}"
-            )
-
-        # participants: 用 speaker_id 去重，保留最后一次出现的 name
-        parts_map: dict[str, dict] = {}
-        for r in raws:
-            sid = str(r["speaker_id"])
-            parts_map[sid] = {
-                "speaker_id": sid,
-                "speaker_name": r["speaker_name"],
-                "role": r["role"],
-            }
-        participants = list(parts_map.values())
-
-        # event_start / event_end
-        times = [int(r["created_at"]) for r in raws]
-        event_start_at = min(times)
-        event_end_at = max(times)
-        extracted_at = int(time.time())
-
-        # --- 2. embedding（用 title + content 拼接做 embedding 输入）---
-        embed_text = f"{ev.title}\n{ev.content}"
-        embedding = await self._embed(embed_text)
-        if embedding is None:
-            raise RuntimeError("embedding 生成失败，事件不落库")
-
-        # --- 3. transaction: episode + participants + keywords + FTS ---
-        def _tx_write():
-            with self.db.transaction():
-                eid = self.db.insert_episode(
-                    platform=platform,
-                    chat_type=chat_type,
-                    session_id=session_id,
-                    group_id=group_id,
-                    title=ev.title,
-                    content=ev.content,
-                    source_raw_ids=ev.source_raw_ids,
-                    event_start_at=event_start_at,
-                    event_end_at=event_end_at,
-                    extracted_at=extracted_at,
-                )
-                self.db.insert_participants(eid, participants)
-                self.db.insert_keywords(eid, ev.keywords)
-                self.db.insert_fts(eid, ev.title, ev.content, ev.keywords)
-                return eid
-
-        episode_id = await self.db.run(_tx_write)
-
-        # --- 4. vec upsert（vec0 不在事务里）---
-        def _vec_upsert():
-            self.vec.upsert(episode_id, embedding)
-
-        try:
-            await self.db.run(_vec_upsert)
-        except Exception:
-            # vec 写失败 → 把刚写的 episode 也回滚
-            logger.exception(
-                "[Memoir] vec 写入失败，回滚 episode %d", episode_id
-            )
-
-            def _rollback():
-                with self.db.transaction():
-                    self.db.execute(
-                        "DELETE FROM episodes WHERE id = ?", (episode_id,)
-                    )
-                    self.db.execute(
-                        "DELETE FROM episodes_fts WHERE rowid = ?", (episode_id,)
-                    )
-                    # participants/keywords 有 FK CASCADE 会跟着删
-
-            await self.db.run(_rollback)
-            raise
-
-        logger.debug(
-            "[Memoir] episode %d written: %r (raws=%s, parts=%d)",
-            episode_id, ev.title, ev.source_raw_ids, len(participants),
+        logger.info(
+            "[Memoir] wrote %d episode(s), marked %d raw(s) processed",
+            len(episode_ids), len(raw_ids_to_mark),
         )
-        return episode_id
+        return episode_ids

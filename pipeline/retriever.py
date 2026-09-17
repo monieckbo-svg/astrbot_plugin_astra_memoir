@@ -35,15 +35,16 @@ _RRF_K = 60
 @dataclass
 class RetrieverConfig:
     top_k: int = 4
-    # cosine distance 越小越近；sqlite-vec vec0 cosine 范围 [0, 2]
-    # 阈值先给一个保守默认：0.9（即 similarity > 0.55），真实数据再调
+    # sqlite-vec cosine distance 范围 [0, 2]（0=同向，1=正交，2=反向）
+    # similarity = 1 - distance
+    # 阈值先给一个保守默认：0.9（真实数据后再调）
     max_cosine_distance: float = 0.9
     # KNN / FTS 各取多少候选做 RRF
     vec_pool_size: int = 20
     fts_pool_size: int = 20
-    # 加分权重（RRF 分数量级约 0.01~0.03，bonus 保持在同量级）
-    participant_bonus: float = 0.02
-    recency_bonus_max: float = 0.01
+    # 加分权重（RRF 分数量级约 0.01~0.03，bonus 保持在更低量级避免压过语义分）
+    participant_bonus: float = 0.005
+    recency_bonus_max: float = 0.003
     recency_half_life_days: float = 30.0
     # 私聊召回群聊事件的总开关
     enable_group_recall_in_private: bool = True
@@ -103,11 +104,14 @@ class Retriever:
 
     def _visibility_kwargs(
         self, chat_type: str, session_id: str, group_id: str | None,
-    ) -> dict:
+    ) -> dict | None:
         """
         根据当前对话场景生成 storage 层可见性参数。
         - 私聊: 本 session + 所有群（若开关允许）
         - 群聊: 仅当前群
+
+        返回 None 表示"当前场景无法安全召回"（如群聊拿不到 group_id）,
+        retriever 应直接放弃本次召回。
         """
         if chat_type == "private":
             return dict(
@@ -115,9 +119,9 @@ class Retriever:
                 include_all_groups=self.config.enable_group_recall_in_private,
             )
         # group
-        if group_id is None:
-            # 保险：拿不到群 id 就啥也不召回，避免误召其他人的会话
-            return dict()
+        if group_id is None or not str(group_id).strip():
+            # 群聊拿不到 group_id → 绝不召回（否则会变成全库可见）
+            return None
         return dict(include_group_id=group_id)
 
     # ---------- 主入口 ----------
@@ -133,27 +137,41 @@ class Retriever:
     ) -> list[RecallResult]:
         """
         主检索入口。返回按最终得分排序的 top_k 条 RecallResult。
-        无有效命中返回 []。
+        无有效命中 / 无法安全召回时返回 []。
         """
         if not query or not query.strip():
             return []
 
-        # 1. 各路召回
+        vis = self._visibility_kwargs(chat_type, session_id, group_id)
+        if vis is None:
+            # 群聊拿不到 group_id → 直接放弃，绝不注入
+            logger.debug(
+                "[Memoir] recall: no safe visibility scope (chat_type=%s, group_id=%r), skip",
+                chat_type, group_id,
+            )
+            return []
+
+        # 1. 向量召回
         vec_hits: list[tuple[int, float]] = []
         q_vec = await self._embed_query(query)
         if q_vec is not None:
-            vis = self._visibility_kwargs(chat_type, session_id, group_id)
-
             def _knn():
                 return self.vec.knn(q_vec, k=self.config.vec_pool_size, **vis)
+            try:
+                vec_hits = await self.db.run(_knn)
+            except Exception:
+                logger.exception("[Memoir] recall: vector KNN 失败")
+                vec_hits = []
 
-            vec_hits = await self.db.run(_knn)
-
-        def _fts():
-            vis = self._visibility_kwargs(chat_type, session_id, group_id)
-            return self.db.fts_search(query, limit=self.config.fts_pool_size, **vis)
-
-        fts_hits = await self.db.run(_fts)
+        # 2. FTS 召回（失败降级到只用 vec，不整轮 recall 失败）
+        fts_hits: list[int] = []
+        try:
+            def _fts():
+                return self.db.fts_search(query, limit=self.config.fts_pool_size, **vis)
+            fts_hits = await self.db.run(_fts)
+        except Exception as e:
+            logger.warning("[Memoir] recall: FTS search failed (%s), fallback to vec only", e)
+            fts_hits = []
 
         if not vec_hits and not fts_hits:
             return []

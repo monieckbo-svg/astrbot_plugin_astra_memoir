@@ -194,7 +194,7 @@ async def prepare_data(db: MemoirDB, vec: VecStore, embed: ThemeEmbedding):
             db.insert_keywords(eid, keywords)
             db.insert_fts(eid, title, content, keywords)
         v = await embed.get_embedding(f"{title}\n{content}")
-        vec.upsert(eid, v)
+        vec.upsert(eid, v, chat_type=chat_type, session_id=session_id, group_id=group_id)
         return eid
 
     e1 = await _mk_episode(
