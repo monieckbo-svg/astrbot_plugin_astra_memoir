@@ -144,6 +144,7 @@ class FakeLLMProvider:
                 n = spec.get("raw_hits_needed", 1)
                 events.append({
                     "title": spec["title"],
+                    "importance": spec.get("importance", 3),
                     "content": spec["content"],
                     "source_raw_ids": raw_ids[:n],
                     "keywords": spec.get("keywords", []),
@@ -351,10 +352,10 @@ async def main():
         assert len(r) == 1, "私聊应能召回群聊'小雨感冒'事件"
         print("✓ 私聊场景可召回群聊事件")
 
-        # 群聊召回私聊：不能
-        r = db.fts_search("石锅拌饭", include_group_id="g_main")
-        assert r == [], "群聊不应召回私聊事件"
-        print("✓ 群聊场景严格隔离私聊事件")
+        # 用户已授权群聊统一候选池：当前群 + 所有私聊
+        r = db.fts_search("石锅拌饭", include_group_id="g_main", include_all_private=True)
+        assert r, "群聊应可召回私聊事件"
+        print("✓ 群聊场景可召回私聊事件")
 
         print()
         print("========== ALL INTEGRATION TESTS PASSED ==========")

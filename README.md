@@ -66,6 +66,10 @@ git pull
 
 如需在私聊召回群聊记忆，在插件配置中把 owner QQ 填入 `owner_qq_id` 并打开 `enable_group_recall_in_private`；留空时私聊用户只能查自己的私聊记忆。旧版的 `cross_group_owner_ids` 已不再读取，升级后请在新字段重新填写。
 
+群聊召回范围为当前群及**所有私聊 episode**（用户明确授权的共享记忆模式）。群里任何人都可能通过相关提问触发私人记忆注入，Astra 是否说出由其人设决定；请只在接受这一隐私风险时安装此版本。
+
+新事件由提取模型给出 `importance=1..5`；1 不写入长期 episode，但原文照常标记已处理。2 超过 30 天未强化会归档，不物理删除；面板仍可查看。3/4/5 按时间衰减检索排序，5 不衰减。只有真实用户消息明确包含完整事件标题，或新提取事件与旧事件高度相似时才强化；单纯召回或 Debug Recall 不强化。默认注入上限 3 条，硬上限 5 条。
+
 其他可以先用默认。想调优时看：
 
 - `retrieval_max_cosine_distance`（默认 0.9）—— 相关性阈值，改小 = 更严格，改大 = 更宽松
@@ -149,7 +153,7 @@ sqlite3 $DB "SELECT COUNT(*) FROM episode_vec;"
 **做**：
 - 私聊事件 + 群聊事件消化
 - 语义 + FTS 混合检索
-- owner allowlist 中的私聊用户可召回群聊；群聊隔离私聊
+- owner 私聊可召回群聊；群聊可召回所有私聊（明确授权，存在泄漏风险）
 - 每人的话严格归属（QQ 号做身份主键）
 - 30 天原文 TTL
 
@@ -158,7 +162,7 @@ sqlite3 $DB "SELECT COUNT(*) FROM episode_vec;"
 - 群友画像 / 关系图
 - 日报 / 日记（astra-room 的活）
 - Discord（预留字段，代码不写）
-- 记忆衰减 / dream / cron 打包
+- 复杂记忆合并 / dream / cron 打包
 
 ---
 

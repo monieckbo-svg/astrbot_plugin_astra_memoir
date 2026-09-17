@@ -59,7 +59,7 @@ class AstraMemoir(Star):
         )
 
         retr_cfg = RetrieverConfig(
-            top_k=int(self._cfg("retrieval_top_k", 4)),
+            top_k=max(1, min(int(self._cfg("retrieval_top_k", 3)), 5)),
             max_cosine_distance=float(self._cfg("retrieval_max_cosine_distance", 0.9)),
             enable_group_recall_in_private=bool(
                 self._cfg("enable_group_recall_in_private", True)

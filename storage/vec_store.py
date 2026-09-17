@@ -31,6 +31,7 @@ class VecStore:
     def upsert(
         self, episode_id: int, embedding: list[float],
         *, chat_type: str, session_id: str, group_id: str | None,
+        is_archived: int = 0,
     ) -> None:
         """
         插入或更新一条 episode 的向量，携带 metadata 用于 KNN 阶段过滤。
@@ -41,9 +42,9 @@ class VecStore:
             "DELETE FROM episode_vec WHERE episode_id = ?", (episode_id,)
         )
         self.db.execute(
-            "INSERT INTO episode_vec(episode_id, chat_type, session_id, group_id, embedding) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (episode_id, chat_type, session_id, group_id or "", packed),
+            "INSERT INTO episode_vec(episode_id, chat_type, session_id, group_id, is_archived, embedding) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (episode_id, chat_type, session_id, group_id or "", is_archived, packed),
         )
 
     def delete(self, episode_id: int) -> None:
@@ -59,6 +60,7 @@ class VecStore:
         include_session_id: str | None = None,
         include_group_id: str | None = None,
         include_all_groups: bool = False,
+        include_all_private: bool = False,
     ) -> list[tuple[int, float]]:
         """
         KNN 检索 top-k，返回 [(episode_id, cosine_distance), ...]，距离升序。
@@ -70,15 +72,18 @@ class VecStore:
           → 两路 KNN 各取 k，再 merge（vec0 一次 query 不支持 OR，需要拆两次）
         - 群聊场景: include_group_id=当前群
           → 单路 KNN with WHERE
+        - 群聊共享模式: include_group_id=当前群, include_all_private=True
+          → 当前群与全部私聊两路 KNN
         """
         # 无可见性 → 全库 KNN
         no_scope = (
             include_session_id is None
             and include_group_id is None
             and not include_all_groups
+            and not include_all_private
         )
         if no_scope:
-            return self._knn_where(query_embedding, k, extra_where="", params=[])
+            return self._knn_where(query_embedding, k, extra_where="AND is_archived = 0", params=[])
 
         results: dict[int, float] = {}
 
@@ -86,8 +91,17 @@ class VecStore:
         if include_session_id is not None:
             for eid, dist in self._knn_where(
                 query_embedding, k,
-                extra_where="AND chat_type = 'private' AND session_id = ?",
+                extra_where="AND is_archived = 0 AND chat_type = 'private' AND session_id = ?",
                 params=[include_session_id],
+            ):
+                if eid not in results or dist < results[eid]:
+                    results[eid] = dist
+
+        if include_all_private:
+            for eid, dist in self._knn_where(
+                query_embedding, k,
+                extra_where="AND is_archived = 0 AND chat_type = 'private'",
+                params=[],
             ):
                 if eid not in results or dist < results[eid]:
                     results[eid] = dist
@@ -96,7 +110,7 @@ class VecStore:
         if include_all_groups:
             for eid, dist in self._knn_where(
                 query_embedding, k,
-                extra_where="AND chat_type = 'group'",
+                extra_where="AND is_archived = 0 AND chat_type = 'group'",
                 params=[],
             ):
                 if eid not in results or dist < results[eid]:
@@ -105,7 +119,7 @@ class VecStore:
         elif include_group_id is not None:
             for eid, dist in self._knn_where(
                 query_embedding, k,
-                extra_where="AND chat_type = 'group' AND group_id = ?",
+                extra_where="AND is_archived = 0 AND chat_type = 'group' AND group_id = ?",
                 params=[include_group_id],
             ):
                 if eid not in results or dist < results[eid]:

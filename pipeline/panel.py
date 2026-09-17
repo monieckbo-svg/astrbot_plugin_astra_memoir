@@ -81,6 +81,9 @@ class MemoirPanel:
             episodes_total = self.db.fetchone(
                 "SELECT COUNT(*) AS n FROM episodes"
             )["n"]
+            episodes_archived = self.db.fetchone(
+                "SELECT COUNT(*) AS n FROM episodes WHERE is_archived = 1"
+            )["n"]
             episodes_today = self.db.fetchone(
                 "SELECT COUNT(*) AS n FROM episodes WHERE extracted_at >= ?",
                 (today_start,),
@@ -105,6 +108,7 @@ class MemoirPanel:
             )
             return {
                 "episodes_total": episodes_total,
+                "episodes_archived": episodes_archived,
                 "episodes_today": episodes_today,
                 "raw_total": raw_total,
                 "raw_unprocessed": raw_unproc,
@@ -143,6 +147,7 @@ class MemoirPanel:
         participant = _query("participant")
         session_id = _query("session_id")
         group_id = _query("group_id")
+        archived = _query("archived")
         search = _query("q")
         try:
             limit = min(int(_query("limit", 50)), 200)
@@ -166,6 +171,9 @@ class MemoirPanel:
             if group_id:
                 conditions.append("group_id = ?")
                 params.append(group_id)
+            if archived in ("0", "1"):
+                conditions.append("is_archived = ?")
+                params.append(int(archived))
 
             if search:
                 sql = (
@@ -416,6 +424,7 @@ class MemoirPanel:
                         "participant_bonus": r.debug_participant_bonus,
                         "recency_bonus": r.debug_recency_bonus,
                         "final_score": r.debug_final_score,
+                        "decay_factor": r.debug_decay_factor,
                         "relevance_passed": r.debug_relevance_passed,
                     }
                     for r in results

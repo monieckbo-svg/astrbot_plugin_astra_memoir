@@ -20,6 +20,7 @@ from __future__ import annotations
 import time
 import math
 import struct
+from datetime import datetime, timezone
 
 from astrbot.api import logger
 
@@ -64,7 +65,7 @@ class EpisodeWriter:
         while True:
             def _load():
                 return self.db.fetchall(
-                    "SELECT e.id, e.title, e.content, e.chat_type, e.session_id, e.group_id "
+                    "SELECT e.id, e.title, e.content, e.chat_type, e.session_id, e.group_id, e.is_archived "
                     "FROM episodes e LEFT JOIN episode_vec v ON v.episode_id = e.id "
                     "WHERE v.episode_id IS NULL AND e.id > ? ORDER BY e.id LIMIT ?",
                     (last_id, batch_size),
@@ -82,6 +83,7 @@ class EpisodeWriter:
                     await self.db.run(lambda row=row, embedding=embedding: self.vec.upsert(
                         row["id"], embedding, chat_type=row["chat_type"],
                         session_id=row["session_id"], group_id=row["group_id"],
+                        is_archived=row["is_archived"],
                     ))
                     repaired += 1
                 except Exception:
@@ -143,6 +145,12 @@ class EpisodeWriter:
 
         raws_by_id = {r["id"]: r for r in raws}
 
+        # importance=1 不进长期 episode，但整批 raw 仍在事务里标 processed。
+        events = [ev for ev in events if ev.importance > 1]
+        if not events:
+            await self.db.run(lambda: self.db.mark_processed(raw_ids_to_mark, int(time.time())))
+            return []
+
         # 2. 批量生成 embedding（并发）
         import asyncio
         embed_tasks = [
@@ -187,13 +195,26 @@ class EpisodeWriter:
                     packed = struct.pack(f"{len(emb)}f", *emb)
                     duplicate = self.db.fetchone(
                         "SELECT e.id FROM episodes e JOIN episode_vec v ON v.episode_id = e.id "
-                        "WHERE e.session_id = ? AND e.event_end_at BETWEEN ? AND ? "
+                        "WHERE e.session_id = ? "
                         "AND vec_distance_cosine(v.embedding, ?) <= 0.025 "
                         "ORDER BY e.id DESC LIMIT 1",
-                        (session_id, pp["event_end_at"] - 86400,
-                         pp["event_end_at"] + 86400, packed),
+                        (session_id, packed),
                     )
-                    if duplicate or any(
+                    if duplicate:
+                        # 新事件和旧事件高度相同，视为再次提及；不是因误召回而强化。
+                        self.db.execute(
+                            "UPDATE episodes SET reinforcement_count = reinforcement_count + 1, "
+                            "last_reinforced_at = ?, is_archived = 0, importance = MAX(importance, ?) "
+                            "WHERE id = ?",
+                            (datetime.now(timezone.utc).isoformat(), ev.importance, duplicate["id"]),
+                        )
+                        self.db.execute(
+                            "UPDATE episode_vec SET is_archived = 0 WHERE episode_id = ?",
+                            (duplicate["id"],),
+                        )
+                        logger.info("[Memoir] repeated episode reinforced: %s", ev.title)
+                        continue
+                    if any(
                         1 - sum(a*b for a, b in zip(emb, old)) /
                         (math.sqrt(sum(a*a for a in emb) * sum(b*b for b in old)) or 1) <= 0.025
                         for old in accepted_embeddings
@@ -211,6 +232,7 @@ class EpisodeWriter:
                         event_start_at=pp["event_start_at"],
                         event_end_at=pp["event_end_at"],
                         extracted_at=extracted_at,
+                        importance=ev.importance,
                     )
                     self.db.insert_participants(eid, pp["participants"])
                     self.db.insert_keywords(eid, ev.keywords)

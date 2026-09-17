@@ -37,6 +37,7 @@ class ExtractedEvent:
     content: str
     source_raw_ids: list[int]     # 全部 ∈ allowed，至少一个 ∈ new_ids
     keywords: list[str]
+    importance: int = 3
 
 
 @dataclass
@@ -76,6 +77,8 @@ _SYSTEM_PROMPT_PRIVATE = """你是记忆系统的事件提取器，只输出严�
 5. 单纯的"哈哈哈"、表情、寒暄没有值得记忆的内容时，返回 events=[]。
 6. source_raw_ids 可引用 <context_only> 和 <new_messages> 中与事件直接相关的 raw_id，但至少包含一个 <new_messages> raw_id；严禁引用本批之外的 raw_id。
 7. keywords 是 2~5 个中文关键词，用于后续检索命中。
+8. 每个事件必须给 importance 整数 1~5。1=琐碎临时（纯闲聊、表情包、一次性玩笑、普通画图请求、单次无后续价值小事、重复性日常）；2=短期可能继续聊但长期价值低；3=普通可再提事件；4=重要决定、持续项目变化、明确状态变化或明显影响后续互动；5=极重要共同经历或长期关键事件。
+9. 高频重复日常行为（频繁画图、普通闲聊、表情包、问候）默认 importance=1；只有本次出现新的偏好、决定、冲突、显著情绪、新设定或持续影响未来互动的信息才提高。只评重要性，不决定永久保存。
 
 【第一人称记事】
 - assistant（星星）在事件中：用"我"指代星星本人（例：我提议、我告诉陆忱……）
@@ -84,7 +87,7 @@ _SYSTEM_PROMPT_PRIVATE = """你是记忆系统的事件提取器，只输出严�
 
 输出格式（严格 JSON，不带 markdown fence 或额外说明）：
 {"events":[
-  {"title":"简短标题","content":"详细内容","source_raw_ids":[101,102],"keywords":["关键词1","关键词2"]}
+  {"title":"简短标题","content":"详细内容","importance":3,"source_raw_ids":[101,102],"keywords":["关键词1","关键词2"]}
 ]}
 如没有值得记忆的事件，返回：{"events":[]}"""
 
@@ -105,6 +108,8 @@ _SYSTEM_PROMPT_GROUP = """你是记忆系统的事件提取器，只输出严格
 6. 单纯的"哈哈哈"、表情、寒暄没有值得记忆的内容时，返回 events=[]。
 7. source_raw_ids 可引用 <context_only> 和 <new_messages> 中与事件直接相关的 raw_id，但至少包含一个 <new_messages> raw_id；严禁引用本批之外的 raw_id。
 8. keywords 是 2~5 个中文关键词，用于后续检索命中。
+9. 每个事件必须给 importance 整数 1~5。1=琐碎临时（纯闲聊、表情包、一次性玩笑、普通画图请求、重复性日常）；2=短期可能继续聊但长期价值低；3=普通可再提事件；4=重要决定、持续项目变化、明确状态变化或明显影响后续互动；5=极重要共同经历或长期关键事件。
+10. 高频重复日常行为（频繁画图、普通闲聊、表情包、问候）默认 importance=1；只有本次出现新的偏好、决定、冲突、显著情绪、新设定或持续影响未来互动的信息才提高。只评重要性，不决定永久保存。
 
 【第一人称记事】
 - role=assistant（星星）参与的事件：用"我"指代星星本人
@@ -113,7 +118,7 @@ _SYSTEM_PROMPT_GROUP = """你是记忆系统的事件提取器，只输出严格
 
 输出格式（严格 JSON，不带 markdown fence 或额外说明）：
 {"events":[
-  {"title":"简短标题","content":"详细内容，含谁说了什么","source_raw_ids":[8871,8872],"keywords":["关键词1","关键词2"]}
+  {"title":"简短标题","content":"详细内容，含谁说了什么","importance":3,"source_raw_ids":[8871,8872],"keywords":["关键词1","关键词2"]}
 ]}
 如没有值得记忆的事件，返回：{"events":[]}"""
 
@@ -251,6 +256,12 @@ def parse_llm_response(
         content = str(ev.get("content", "")).strip()
         raw_ids = ev.get("source_raw_ids", [])
         keywords = ev.get("keywords", [])
+        importance = ev.get("importance")
+
+        if type(importance) is not int or not 1 <= importance <= 5:
+            logger.debug("[Memoir] event #%d rejected: invalid importance=%r", i, importance)
+            rejected += 1
+            continue
 
         if not title or not content:
             logger.debug("[Memoir] event #%d rejected: empty title/content", i)
@@ -293,6 +304,7 @@ def parse_llm_response(
             content=content,
             source_raw_ids=ids,
             keywords=kw[:8],
+            importance=importance,
         ))
 
     # LLM 明明返回了事件但全部被过滤 → 视为失败，保持 raw unprocessed

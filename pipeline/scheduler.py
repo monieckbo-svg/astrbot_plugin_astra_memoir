@@ -323,6 +323,9 @@ class BatchScheduler:
             return self.db.delete_expired_raw(cutoff)
 
         n = await self.db.run(_del)
+        archived = await self.db.run(lambda: self.db.archive_expired_short_term(int(time.time())))
+        if archived:
+            logger.info("[Memoir] archived %d expired importance=2 episode(s)", archived)
         if n > 0:
             logger.info(
                 "[Memoir] TTL: 清理过期原文 %d 条 (retention=%d days)",

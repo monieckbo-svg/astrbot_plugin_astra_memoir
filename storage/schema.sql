@@ -52,7 +52,11 @@ CREATE TABLE IF NOT EXISTS episodes (
     event_start_at      INTEGER NOT NULL,               -- source raw 最早 created_at
     event_end_at        INTEGER NOT NULL,               -- source raw 最晚 created_at
     extracted_at        INTEGER NOT NULL,               -- 模型完成提取的时间
-    last_accessed_at    INTEGER
+    last_accessed_at    INTEGER,
+    importance          INTEGER NOT NULL DEFAULT 3,
+    last_reinforced_at  TEXT,
+    reinforcement_count INTEGER NOT NULL DEFAULT 0,
+    is_archived         INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_ep_session_time

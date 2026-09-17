@@ -145,6 +145,7 @@ class HallucinatingProvider:
             "events": [
                 {
                     "title": "幻觉事件",
+                    "importance": 3,
                     "content": "假装引用了不属于本 session 的 raw",
                     "source_raw_ids": [self.out_of_scope_id],
                     "keywords": ["假"],
@@ -161,9 +162,9 @@ class OneGoodOneBadProvider:
     async def text_chat(self, prompt, system_prompt="", **kw):
         return FakeLLMResponse(json.dumps({
             "events": [
-                {"title": "好事件", "content": "aaa",
+                {"title": "好事件", "content": "aaa", "importance": 3,
                  "source_raw_ids": self.good, "keywords": []},
-                {"title": "只用overlap", "content": "bbb",
+                {"title": "只用overlap", "content": "bbb", "importance": 3,
                  "source_raw_ids": [self.bad], "keywords": []},
             ]
         }, ensure_ascii=False))
@@ -180,6 +181,7 @@ class SimpleGoodProvider:
         return FakeLLMResponse(json.dumps({
             "events": [{
                 "title": "事件",
+                "importance": 3,
                 "content": "内容 " + " ".join(str(r) for r in raw_ids[:3]),
                 "source_raw_ids": raw_ids[:3],
                 "keywords": ["k"],
@@ -539,8 +541,8 @@ async def test_11_partial_invalid_is_atomic():
     from importlib import import_module
     parse = import_module(f"{_PKG}.pipeline.extractor").parse_llm_response
     result = parse(json.dumps({"events": [
-        {"title": "好", "content": "事", "source_raw_ids": [1]},
-        {"title": "坏", "content": "事", "source_raw_ids": [999]},
+        {"title": "好", "content": "事", "importance": 3, "source_raw_ids": [1]},
+        {"title": "坏", "content": "事", "importance": 3, "source_raw_ids": [999]},
     ]}), new_msg_ids={1}, overlap_msg_ids=set())
     assert not result.success and result.events == [] and result.rejected_count == 1
     print("✓ 11. 混合合法/非法事件整批拒绝")

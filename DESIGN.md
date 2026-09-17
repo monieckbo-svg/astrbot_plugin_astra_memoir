@@ -392,9 +392,9 @@ for eid in scores:
 - **配置在 `owner_qq_id` 中的 owner 私聊时**：召回范围 = 当前私聊 episode ∪ **所有 QQ 群聊 episode**
   - 所以能问 "上午群里那个插件后来怎么了"
 - 其他私聊用户：仅能召回自己的私聊 episode
-- **Astra 在群里时**：召回范围 = **仅当前群 episode**
-  - 不带出任何私聊或其他群
-  - 防止群里泄漏隐私
+- **Astra 在群里时**：召回范围 = **当前群 episode ∪ 所有私聊 episode**
+  - 用户明确授权开放私聊候选；群成员可触发私人记忆注入，存在泄漏风险
+  - 其他群的群聊 episode 不进入候选
 
 ### 6.4 注入格式（extra_user_content_parts + mark_as_temp）
 ```python
@@ -427,7 +427,7 @@ req.extra_user_content_parts.append(
 - 已 processed 且 `created_at < now - retention_days` → 删除
 - 未处理的永不删（保护未消化数据）
 
-默认 `retention_days = 30`。episode 永久保留（Phase 1 不做衰减）。
+原文默认 `retention_days = 30`。episode 不物理删除；importance=1 不写 episode，importance=2 超过 30 天无强化归档，其他 importance 按检索时效衰减。旧 episode 迁移后默认 importance=3。
 
 ---
 
@@ -456,7 +456,7 @@ req.extra_user_content_parts.append(
   "overlap_group_messages":    4,
   "overlap_private_messages":  2,
   "raw_retention_days":        30,
-  "retrieval_top_k":           4,
+  "retrieval_top_k":           3,
   "enable_group_recall_in_private": true,
   "owner_qq_id":              "owner QQ，单个 QQ 号",
   "scheduler_interval_seconds": 60
@@ -477,7 +477,7 @@ req.extra_user_content_parts.append(
 6. ✅ 群聊跨批次同一件事，overlap 能帮理解，每个 episode 必须引用至少一个新批次 raw_id
 7. ✅ 群友 A 的事实绝不归到群友 B 名下（QQ ID 由代码回查决定）
 8. ✅ Astra 群里参与时，Astra 出现在 participants（用 event.get_self_id()）
-9. ✅ 私聊自动召回群聊事件；群聊自动召回不带出任何私聊 episode
+9. ✅ owner 私聊自动召回群聊事件；群聊自动召回可使用所有私聊 episode（用户已授权）
 10. ✅ raw message 过期删除后，episode 与检索仍正常
 11. ✅ hook 重复触发（插件 reload / 消息重放）不会脏库（dedupe_key UNIQUE）
 12. ✅ prompt cache 不被破坏（system_prompt / prompt / contexts 全部不动，记忆走 extra_user_content_parts + mark_as_temp）

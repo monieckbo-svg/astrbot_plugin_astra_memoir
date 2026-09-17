@@ -348,15 +348,16 @@ async def main():
         assert e4 not in ids, f"私聊不应召回别人的 private，got {ids}"
         print(f"✓ 场景 3: 私聊隔离别人的 private (query='天气', got {ids})")
 
-        # === 4. 群聊不能召回任何 private ===
+        # === 4. 用户明确开启群聊检索私聊（包括其他人的私聊）===
         r = await retr.recall(
             "石锅拌饭 天气", session_id="grp", chat_type="group",
             group_id="g_main", current_speaker_id="222",
         )
         ids = [x.episode_id for x in r]
-        assert e1 not in ids, f"群聊不应召回 e1，got {ids}"
-        assert e4 not in ids, f"群聊不应召回 e4，got {ids}"
-        print(f"✓ 场景 4: 群聊隔离所有 private ({ids})")
+        assert e1 in ids, f"群聊应能召回 e1，got {ids}"
+        assert e4 in ids, f"群聊应能召回其他人私聊 e4，got {ids}"
+        assert retr.visibility_info("group", "grp", "g_main", "222")["visibility_scope"] == "current_group+all_private"
+        print(f"✓ 场景 4: 群聊统一检索当前群和全部 private ({ids})")
 
         # === 5. participant 不在事件里但语义相关仍能召回 ===
         #   陆忱(111) 没参与 e3（小雨感冒），但语义相关应能召回

@@ -144,6 +144,11 @@
         <option value="private">私聊</option>
         <option value="group">群聊</option>
       </select>
+      <select id="epArchived">
+        <option value="">全部状态</option>
+        <option value="0">自动召回中</option>
+        <option value="1">已归档</option>
+      </select>
       <input type="search" id="epSearch" placeholder="搜索标题/内容/关键词（FTS）">
       <input type="text" id="epParticipant" placeholder="Participant QQ" style="width: 120px">
       <button onclick="loadEpisodes()">筛选</button>
@@ -257,6 +262,7 @@ async function loadStats() {
     const d = await api('stats');
     const items = [
       ['Episode 总数', d.episodes_total],
+      ['已归档', d.episodes_archived ?? 0],
       ['今日新增', d.episodes_today],
       ['Raw 总数', d.raw_total],
       ['Raw 未处理', d.raw_unprocessed],
@@ -312,9 +318,11 @@ async function loadEpisodes() {
   const ct = document.getElementById('epChatType').value;
   const q = document.getElementById('epSearch').value.trim();
   const pt = document.getElementById('epParticipant').value.trim();
+  const archived = document.getElementById('epArchived').value;
   if (ct) params.chat_type = ct;
   if (q) params.q = q;
   if (pt) params.participant = pt;
+  if (archived !== '') params.archived = archived;
   try {
     const eps = await api('episodes', params);
     if (!eps.length) {
@@ -328,7 +336,7 @@ async function loadEpisodes() {
       const tagLabel = ep.chat_type === 'group' ? '群聊' : '私聊';
       return `<div class="card" onclick="loadDetail(${ep.id})" style="cursor:pointer">
         <div class="ep-title"><span class="tag ${tag}">${tagLabel}</span>${escapeHtml(ep.title)}</div>
-        <div class="ep-meta">${dt} · #${ep.id}</div>
+        <div class="ep-meta">${dt} · #${ep.id} · importance=${ep.importance ?? 3} · ${ep.is_archived ? '已归档' : '自动召回中'} · 强化 ${ep.reinforcement_count ?? 0} 次</div>
         <div class="ep-content">${escapeHtml(ep.content)}</div>
         <div class="ep-parts">参与者：${escapeHtml(parts)}</div>
       </div>`;
@@ -373,7 +381,7 @@ async function loadDetail(id) {
         <div class="ep-title" style="font-size:18px">
           <span class="tag ${tag}">${tagLabel}</span>${escapeHtml(ep.title)}
         </div>
-        <div class="ep-meta">${dt}</div>
+        <div class="ep-meta">${dt} · importance=${ep.importance ?? 3} · ${ep.is_archived ? '已归档' : '自动召回中'} · 强化 ${ep.reinforcement_count ?? 0} 次</div>
         <div class="ep-content" style="margin: 10px 0">${escapeHtml(ep.content)}</div>
         <div>参与者：${parts || '<span class="empty">无</span>'}</div>
         ${kw ? '<div style="margin-top:6px">关键词：' + kw + '</div>' : ''}
@@ -390,6 +398,7 @@ async function loadDetail(id) {
           session_id: ep.session_id,
           group_id: ep.group_id,
           extracted_at: ep.extracted_at,
+          last_reinforced_at: ep.last_reinforced_at,
           vec_present: ep.vec_present,
           participants_full: ep.participants,
         }, null, 2))}</pre>
@@ -477,7 +486,7 @@ async function runDebugRecall() {
           <div class="ep-meta">${dt} · id=${res.episode_id}</div>
           <div class="ep-content">${escapeHtml(res.content)}</div>
           <div class="ep-parts">参与者：${escapeHtml(res.participants.join('、'))}</div>
-          <div class="result-scores">${vec} · fts_hit=${res.fts_hit} · relevance_passed=${res.relevance_passed} · rrf=${res.rrf_score.toFixed(4)} · participant=${res.participant_bonus.toFixed(4)} · recency=${res.recency_bonus.toFixed(4)} · final=${res.final_score.toFixed(4)}</div>
+          <div class="result-scores">${vec} · fts_hit=${res.fts_hit} · relevance_passed=${res.relevance_passed} · rrf=${res.rrf_score.toFixed(4)} · participant=${res.participant_bonus.toFixed(4)} · recency=${res.recency_bonus.toFixed(4)} · decay=${(res.decay_factor ?? 1).toFixed(4)} · final=${res.final_score.toFixed(4)}</div>
         </div>`;
       }).join('');
     }

@@ -56,9 +56,9 @@
     "default": 30
   },
   "retrieval_top_k": {
-    "description": "每次注入给星星的记忆条数上限",
+    "description": "每次注入给星星的记忆条数上限（最多 5 条）",
     "type": "int",
-    "default": 4
+    "default": 3
   },
   "retrieval_max_cosine_distance": {
     "description": "相关性阈值：向量距离超过这个值且 FTS 未命中的候选会被丢弃（避免注入不相关记忆）。sqlite-vec 的 cosine distance 范围 [0, 2]，越小越近。默认 0.9 保守，真实数据后再调；改大→召回更宽松；改小→更严格",

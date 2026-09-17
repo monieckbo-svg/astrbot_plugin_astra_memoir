@@ -71,12 +71,24 @@ class MemoirDB:
         schema_sql = _SCHEMA_SQL_PATH.read_text(encoding="utf-8")
         conn.executescript(schema_sql)
 
+        # 旧库增量迁移；保留 episodes / FTS / raw，不重建用户数据。
+        episode_columns = {row["name"] for row in conn.execute("PRAGMA table_info(episodes)")}
+        for name, definition in (
+            ("importance", "INTEGER NOT NULL DEFAULT 3"),
+            ("last_reinforced_at", "TEXT"),
+            ("reinforcement_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("is_archived", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in episode_columns:
+                conn.execute(f"ALTER TABLE episodes ADD COLUMN {name} {definition}")
+
         previous = dict(conn.execute("SELECT key, value FROM meta WHERE key IN ('embedding_dim', 'embedding_provider_id')").fetchall())
         vec_exists = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'episode_vec'").fetchone() is not None
         # 旧版本没有 provider 元信息时必须重建，避免混用不同模型的向量。
         changed = vec_exists and (
             previous.get("embedding_dim") != str(self.embedding_dim)
             or previous.get("embedding_provider_id") != self.embedding_provider_id
+            or "is_archived" not in {row["name"] for row in conn.execute("PRAGMA table_info(episode_vec)")}
         )
         if changed:
             conn.execute("DROP TABLE episode_vec")
@@ -90,6 +102,7 @@ class MemoirDB:
                 chat_type   TEXT,
                 session_id  TEXT,
                 group_id    TEXT,
+                is_archived INTEGER,
                 embedding   FLOAT[{self.embedding_dim}] distance_metric=cosine
             )
             """
@@ -402,6 +415,7 @@ class MemoirDB:
         event_start_at: int,
         event_end_at: int,
         extracted_at: int,
+        importance: int = 3,
     ) -> int:
         """插入一条 episode，返回新 id。source_raw_ids 存为 JSON string。"""
         cur = self.execute(
@@ -409,16 +423,33 @@ class MemoirDB:
             INSERT INTO episodes(
                 platform, chat_type, session_id, group_id,
                 title, content, source_raw_ids,
-                event_start_at, event_end_at, extracted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                event_start_at, event_end_at, extracted_at, importance
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 platform, chat_type, session_id, group_id,
                 title, content, json.dumps(source_raw_ids),
-                event_start_at, event_end_at, extracted_at,
+                event_start_at, event_end_at, extracted_at, importance,
             ),
         )
         return cur.lastrowid
+
+    def archive_expired_short_term(self, now_ts: int) -> int:
+        """归档 30 天未强化的 importance=2；不删除正文或向量。"""
+        cutoff = now_ts - 30 * 86400
+        with self.transaction():
+            rows = self.fetchall(
+                "SELECT id FROM episodes WHERE importance = 2 AND is_archived = 0 "
+                "AND COALESCE(CAST(strftime('%s', last_reinforced_at) AS INTEGER), event_end_at) < ?",
+                (cutoff,),
+            )
+            ids = [row["id"] for row in rows]
+            for start in range(0, len(ids), 500):
+                batch = ids[start:start + 500]
+                placeholders = ",".join("?" * len(batch))
+                self.execute(f"UPDATE episodes SET is_archived = 1 WHERE id IN ({placeholders})", batch)
+                self.execute(f"UPDATE episode_vec SET is_archived = 1 WHERE episode_id IN ({placeholders})", batch)
+            return len(ids)
 
     def insert_participants(
         self,
@@ -479,6 +510,7 @@ class MemoirDB:
         include_session_id: str | None = None,
         include_group_id: str | None = None,
         include_all_groups: bool = False,
+        include_all_private: bool = False,
     ) -> list[int]:
         """
         FTS5 搜索，返回 episode_id 列表（按 BM25 排名升序）。
@@ -508,6 +540,8 @@ class MemoirDB:
         if include_session_id is not None:
             or_clauses.append("(e.chat_type = 'private' AND e.session_id = ?)")
             params.append(include_session_id)
+        if include_all_private:
+            or_clauses.append("e.chat_type = 'private'")
         if include_all_groups:
             or_clauses.append("e.chat_type = 'group'")
         elif include_group_id is not None:
@@ -516,6 +550,8 @@ class MemoirDB:
 
         if or_clauses:
             base_sql += "AND (" + " OR ".join(or_clauses) + ") "
+
+        base_sql += "AND e.is_archived = 0 "
 
         base_sql += "ORDER BY bm25(episodes_fts) LIMIT ?"
         params.append(limit)

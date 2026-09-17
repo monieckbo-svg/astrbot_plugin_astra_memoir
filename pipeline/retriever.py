@@ -6,7 +6,7 @@ pipeline/retriever.py — 记忆检索 + 注入
 - query 用 event.get_message_str()，不用被其他插件改写的 req.prompt
 - 可见性硬规则:
   * 私聊场景: 本 private session；配置的 owner 还可检索所有 group episodes
-  * 群聊场景: 只当前 group session，任何 private episode 都不得进入候选
+  * 群聊场景: 当前 group session + 所有 private episodes（用户明确授权的共享模式）
 - RRF 融合 vec + FTS 排名，不直接相加原始分数
 - Relevance gate: 语义距离超过阈值 + 无 FTS 命中 → 丢弃
 - participant 只加 bonus 不硬过滤
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -34,7 +34,7 @@ _RRF_K = 60
 
 @dataclass
 class RetrieverConfig:
-    top_k: int = 4
+    top_k: int = 3
     # sqlite-vec cosine distance 范围 [0, 2]（0=同向，1=正交，2=反向）
     # similarity = 1 - distance
     # 阈值先给一个保守默认：0.9（真实数据后再调）
@@ -57,6 +57,8 @@ class RecallResult:
     title: str
     content: str
     chat_type: str
+    session_id: str
+    group_id: str | None
     event_start_at: int
     participants: list[str]  # 人名列表（去 id）
     # 调试信息（不进注入文本）
@@ -66,6 +68,7 @@ class RecallResult:
     debug_participant_bonus: float = 0.0
     debug_recency_bonus: float = 0.0
     debug_final_score: float = 0.0
+    debug_decay_factor: float = 1.0
     debug_relevance_passed: bool = True
 
 
@@ -129,9 +132,29 @@ class Retriever:
             info["kwargs"] = dict(include_session_id=session_id,
                                   include_all_groups=cross_group)
         elif chat_type == "group" and group_id is not None and str(group_id).strip():
-            info["visibility_scope"] = "current_group_only"
-            info["kwargs"] = dict(include_group_id=group_id)
+            info["visibility_scope"] = "current_group+all_private"
+            info["kwargs"] = dict(include_group_id=group_id, include_all_private=True)
         return info
+
+    @staticmethod
+    def decay_factor(ep, now: int) -> float:
+        """只影响排名，不物理删除；旧库默认 importance=3。"""
+        importance = int(ep["importance"])
+        if importance <= 1:
+            return 0.0
+        if importance >= 5:
+            return 1.0
+        reinforced = ep["last_reinforced_at"]
+        try:
+            effective_ts = datetime.fromisoformat(reinforced).timestamp() if reinforced else int(ep["event_end_at"])
+        except (TypeError, ValueError):
+            effective_ts = int(ep["event_end_at"])
+        age_days = max(0.0, (now - effective_ts) / 86400.0)
+        if importance == 2:
+            return max(0.0, 1.0 - age_days / 7.0)
+        if importance == 3:
+            return max(0.2, 1.0 - age_days / 30.0)
+        return max(0.6, 1.0 - age_days / 180.0)
 
     # ---------- 主入口 ----------
 
@@ -239,7 +262,7 @@ class Retriever:
         scored: list[tuple[float, RecallResult]] = []
         for eid in gated:
             ep = eps_by_id.get(eid)
-            if ep is None:
+            if ep is None or ep["is_archived"]:
                 continue
             score = rrf_scores[eid]
 
@@ -256,12 +279,18 @@ class Retriever:
                 0.5, days_ago / self.config.recency_half_life_days
             )
             score += recency
+            decay = self.decay_factor(ep, now)
+            if decay <= 0:
+                continue
+            score *= decay
 
             scored.append((score, RecallResult(
                 episode_id=eid,
                 title=ep["title"],
                 content=ep["content"],
                 chat_type=ep["chat_type"],
+                session_id=ep["session_id"],
+                group_id=ep["group_id"],
                 event_start_at=int(ep["event_start_at"]),
                 participants=[p[1] for p in parts],
                 debug_vec_distance=vec_dist_map.get(eid),
@@ -270,13 +299,14 @@ class Retriever:
                 debug_participant_bonus=participant_bonus,
                 debug_recency_bonus=recency,
                 debug_final_score=score,
+                debug_decay_factor=decay,
             )))
 
         scored.sort(key=lambda x: -x[0])
-        top = [r for _, r in scored[: self.config.top_k]]
+        top = [r for _, r in scored[: max(1, min(int(self.config.top_k), 5))]]
 
         # debug 日志
-        for s, r in scored[: self.config.top_k]:
+        for s, r in scored[:len(top)]:
             logger.debug(
                 "[Memoir] recall: eid=%d title=%r final=%.4f rrf=%.4f "
                 "vec_dist=%s fts=%s parts=%s",
@@ -301,8 +331,11 @@ class Retriever:
 
         for r in results:
             date_str = datetime.fromtimestamp(r.event_start_at).strftime("%Y-%m-%d %H:%M")
-            chat_label = "群聊" if r.chat_type == "group" else "私聊"
-            lines.append(f"[{date_str}｜{chat_label}｜{r.title}]")
+            if r.chat_type == "group":
+                source = f"群聊｜群 {r.group_id or '未知'}"
+            else:
+                source = f"私聊｜与 {', '.join(r.participants) or '未知'}"
+            lines.append(f"[{source}｜{date_str}｜{r.title}]")
             lines.append(r.content)
             if r.participants:
                 lines.append(f"参与者：{', '.join(r.participants)}")
@@ -310,6 +343,23 @@ class Retriever:
 
         lines.append("[/相关事件记忆]")
         return "\n".join(lines)
+
+    async def reinforce_explicit_mentions(self, query: str, results: list[RecallResult]) -> int:
+        """仅用户原文明确包含完整事件标题时强化；普通召回不计数。"""
+        ids = [r.episode_id for r in results if len(r.title) >= 4 and r.title in query]
+        if not ids:
+            return 0
+        stamp = datetime.now(timezone.utc).isoformat()
+        def _update():
+            with self.db.transaction():
+                for eid in ids:
+                    self.db.execute(
+                        "UPDATE episodes SET reinforcement_count = reinforcement_count + 1, "
+                        "last_reinforced_at = ? WHERE id = ? AND is_archived = 0",
+                        (stamp, eid),
+                    )
+        await self.db.run(_update)
+        return len(ids)
 
     async def inject(self, event: AstrMessageEvent, req) -> None:
         """
@@ -337,6 +387,12 @@ class Retriever:
 
             if not results:
                 return
+
+            # Debug Recall 不走这里；仅真实用户明确提及完整标题才强化。
+            try:
+                await self.reinforce_explicit_mentions(query, results)
+            except Exception:
+                logger.exception("[Memoir] explicit reinforcement 失败，继续注入记忆")
 
             text = self.format_injection(results)
 
