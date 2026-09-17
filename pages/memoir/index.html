@@ -199,7 +199,7 @@
 
 <script>
 // ============ Bridge ============
-// AstrBot 会自动在 </body> 前注入 bridge script（异步加载），
+// AstrBot 会自动在文档末尾注入 bridge script（异步加载），
 // 我们的内联 JS 可能先执行，此时 window.AstrBotPluginPage 还没准备好。
 // 所以 poll 一下等它出现。
 let bridge = null;
