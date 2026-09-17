@@ -3,8 +3,8 @@ pipeline/scheduler.py — 后台调度器 + process_batch 主流程
 
 改动（Phase 1f-fix）:
 
-- bounded batch: 数量触发时只拿最早 N 个（私聊 completed turn，群聊 inbound），
-  剩余留下一批；idle 触发时才把所有未处理（含未闭合 user）全部消化
+- bounded batch: threshold 和 idle 都按 N 个 inbound 分块连续消化；
+  idle 私聊允许未闭合的 user
 - extractor 失败（success=False）→ raw 保持 unprocessed，下次重试
 - extractor 成功但 events=[] → 在同一逻辑事务里标 processed（防死循环）
 - extractor 成功有 events → 走 writer.write_batch，写库+processed 一次原子完成
@@ -208,21 +208,16 @@ class BatchScheduler:
 
         async with lock:
             try:
-                await self._process_batch_locked(session_id, mode)
+                while await self._process_batch_locked(session_id, mode):
+                    await asyncio.sleep(0)
             except Exception:
                 logger.exception(
                     "[Memoir] process_batch 异常，session=%s，raw 保持 unprocessed",
                     session_id,
                 )
 
-    async def _process_batch_locked(self, session_id: str, mode: str) -> None:
-        # 1. 拉本批 new_msgs（bounded！）
-        batch_size = (
-            self.config.private_batch_user_turns
-            if mode == "threshold"
-            else 0  # idle 不看 batch_size
-        )
-
+    async def _process_batch_locked(self, session_id: str, mode: str) -> bool:
+        # 1. 拉本批 new_msgs（threshold / idle 都 bounded）
         def _load_batch():
             # 需要先知道 chat_type 才能算 batch_size 对应字段
             # 先看看 session 的类型
@@ -241,7 +236,13 @@ class BatchScheduler:
 
         new_msgs, chat_type = await self.db.run(_load_batch)
         if not new_msgs:
-            return
+            return False
+        if mode == "threshold":
+            inbound_count = sum(m["role"] == "user" for m in new_msgs)
+            required = (self.config.private_batch_user_turns if chat_type == "private"
+                        else self.config.group_batch_inbound)
+            if inbound_count < required:
+                return False
 
         group_id = new_msgs[0]["group_id"]
         platform = new_msgs[0]["platform"]
@@ -272,7 +273,7 @@ class BatchScheduler:
                 "[Memoir] extract failed for session=%s: %s — raw 保持 unprocessed，下次重试",
                 session_id, result.error,
             )
-            return  # 不 mark_processed
+            return False  # 不 mark_processed
 
         if not result.events:
             # 合法的空结果 → 标 processed（防死循环）
@@ -284,7 +285,7 @@ class BatchScheduler:
             await self.db.run(
                 lambda: self.db.mark_processed(raw_ids, processed_at)
             )
-            return
+            return True
 
         # 5. 有事件 → writer 原子写入
         try:
@@ -301,6 +302,7 @@ class BatchScheduler:
                 session_id, len(new_msgs), len(result.events), len(written),
                 result.rejected_count,
             )
+            return True
         except WriteBatchError as e:
             logger.error(
                 "[Memoir] write_batch failed: %s — raw 保持 unprocessed", e,
@@ -310,6 +312,7 @@ class BatchScheduler:
             logger.exception(
                 "[Memoir] write_batch 异常 — raw 保持 unprocessed"
             )
+        return False
 
     # ---------- TTL ----------
 

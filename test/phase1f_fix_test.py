@@ -5,7 +5,7 @@ phase1f_fix_test.py — Phase 1f-fix 采纳后新增的 8 个场景
 2. malformed JSON → raw 必须仍 unprocessed
 3. 单 event writer 失败（embedding None）→ raw 不得 silently processed
 4. 10 completed + 第 11 条未回复 → 第 11 条不得进 batch
-5. 群里一次积压 50 条 → 第一批只处理设定的 20 条
+5. 群里一次积压 50 条 → 连续处理两个完整的 20 条批次
 6. source_raw_ids 幻觉其它 session id → 整个 event 被拒绝
 7. group_id 缺失 → 召回必须为空
 8. 两 session 并行 process → SQLite transaction 不冲突
@@ -28,6 +28,8 @@ def _mock_astrbot():
     api_api = types.ModuleType("astrbot.api")
     api_api.logger = logging.getLogger("memoir-test")
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
+    api_web = types.ModuleType("astrbot.api.web")
+    api_web.request = types.SimpleNamespace(query={})
 
     api_event = types.ModuleType("astrbot.api.event")
     class _Filter:
@@ -82,6 +84,7 @@ def _mock_astrbot():
 
     sys.modules["astrbot"] = api
     sys.modules["astrbot.api"] = api_api
+    sys.modules["astrbot.api.web"] = api_web
     sys.modules["astrbot.api.event"] = api_event
     sys.modules["astrbot.api.event.filter"] = api_event_filter
     sys.modules["astrbot.api.star"] = api_star
@@ -170,8 +173,8 @@ class SimpleGoodProvider:
     """针对 prompt 里出现的 raw_id 返回一个合法事件。"""
     async def text_chat(self, prompt, system_prompt="", **kw):
         import re
-        raw_ids = [int(x) for x in re.findall(r"\[raw_id=(\d+)\]", prompt)]
-        # 只用 new_messages 里的（我们简单取所有 raw_id 的前 3 个）
+        new_block = prompt.split("<new_messages>", 1)[-1].split("</new_messages>", 1)[0]
+        raw_ids = [int(x) for x in re.findall(r"\[raw_id=(\d+)\]", new_block)]
         if not raw_ids:
             return FakeLLMResponse('{"events":[]}')
         return FakeLLMResponse(json.dumps({
@@ -225,7 +228,7 @@ async def build_stack(llm, embed=None):
         embed = OkEmbeddingProvider()
     context = FakeContext(llm, embed)
     extractor = EventExtractor(context, db, extract_provider_id="")
-    writer = EpisodeWriter(context, db, vec, embedding_provider_id="")
+    writer = EpisodeWriter(embed, db, vec)
     cfg = SchedulerConfig(
         interval_seconds=1,
         private_batch_user_turns=5,
@@ -372,9 +375,9 @@ async def test_5_group_bounded_batch():
     await scheduler.process_batch(session, mode="threshold")
 
     remaining = count_unprocessed(db, session)
-    assert remaining == 30, f"第一批只应吃 20 条，剩 30；实际剩 {remaining}"
+    assert remaining == 10, f"应连续处理两个完整的 20 条批次，剩 10；实际剩 {remaining}"
     db.close()
-    print("✓ 5. 群 50 条积压 → 第一批只吃 20，剩 30")
+    print("✓ 5. 群 50 条积压 → 连续处理两个 20 条批次，剩 10")
 
 
 async def test_6_hallucinated_raw_id_rejected():
@@ -402,7 +405,7 @@ async def test_7_missing_group_id_returns_empty():
     embed = OkEmbeddingProvider()
     context = FakeContext(SimpleGoodProvider(), embed)
     cfg = RetrieverConfig(top_k=4, max_cosine_distance=1.5)
-    retr = Retriever(context, db, vec, cfg, embedding_provider_id="")
+    retr = Retriever(embed, db, vec, cfg)
 
     # 塞一条群 episode
     now = int(time.time())
@@ -481,6 +484,214 @@ async def test_8_parallel_sessions_no_conflict():
     print("✓ 8. 两 session 并行 process_batch → 无冲突，各自落库")
 
 
+async def test_9_group_same_second_and_late_reply():
+    db, vec, extractor, writer, scheduler, _ = await build_stack(SimpleGoodProvider())
+    now = int(time.time())
+    inbound = []
+    for i in range(22):
+        rid = db.insert_raw_message(
+            dedupe_key=f"same-second:{i}", platform="qq", chat_type="group",
+            session_id="same-second", group_id="g", platform_message_id=str(i),
+            speaker_id="111", speaker_name="甲", role="user", content=f"消息{i}",
+            reply_to_id=None, trigger_raw_id=None, created_at=now,
+        )
+        inbound.append(rid)
+    reply = db.insert_raw_message(
+        dedupe_key="late-reply", platform="qq", chat_type="group",
+        session_id="same-second", group_id="g", platform_message_id=None,
+        speaker_id="999", speaker_name="星星", role="assistant", content="回复",
+        reply_to_id=None, trigger_raw_id=inbound[19], created_at=now + 5,
+    )
+    batch = db.get_bounded_batch("same-second", "group", mode="threshold", batch_size=20)
+    ids = {r["id"] for r in batch}
+    assert ids == set(inbound[:20]) | {reply}, ids
+    db.close()
+    print("✓ 9. 同秒第 21/22 条不越界，晚时间戳的回复仍归第 20 条")
+
+
+async def test_10_idle_chunks_and_repair():
+    db, vec, extractor, writer, scheduler, _ = await build_stack(SimpleGoodProvider())
+    scheduler.config.group_batch_inbound = 20
+    now = int(time.time())
+    for i in range(45):
+        db.insert_raw_message(
+            dedupe_key=f"idle:{i}", platform="qq", chat_type="group",
+            session_id="idle", group_id="g", platform_message_id=str(i),
+            speaker_id="111", speaker_name="甲", role="user", content=f"消息{i}",
+            reply_to_id=None, trigger_raw_id=None, created_at=now + i,
+        )
+    assert len(db.get_bounded_batch("idle", "group", mode="idle", batch_size=20)) == 20
+    await scheduler.process_batch("idle", mode="idle")
+    assert count_unprocessed(db, "idle") == 0
+    episode_count = db.fetchone("SELECT COUNT(*) AS n FROM episodes")["n"]
+    assert episode_count == 3, episode_count
+    missing_id = db.fetchone("SELECT MIN(id) AS id FROM episodes")["id"]
+    vec.delete(missing_id)
+    assert missing_id in vec.missing_episode_ids()
+    result = await writer.reindex_missing_vectors()
+    assert result == {"repaired": 1, "failed": 0}, result
+    assert vec.missing_episode_ids() == []
+    db.close()
+    print("✓ 10. idle 45 条分为 20/20/5，缺失向量可补齐")
+
+
+async def test_11_partial_invalid_is_atomic():
+    from importlib import import_module
+    parse = import_module(f"{_PKG}.pipeline.extractor").parse_llm_response
+    result = parse(json.dumps({"events": [
+        {"title": "好", "content": "事", "source_raw_ids": [1]},
+        {"title": "坏", "content": "事", "source_raw_ids": [999]},
+    ]}), new_msg_ids={1}, overlap_msg_ids=set())
+    assert not result.success and result.events == [] and result.rejected_count == 1
+    print("✓ 11. 混合合法/非法事件整批拒绝")
+
+
+async def test_12_provider_switch_rebuilds_only_vectors():
+    db, vec, extractor, writer, scheduler, _ = await build_stack(SimpleGoodProvider())
+    await insert_priv_pair(db, "switch", "p", 0, int(time.time()))
+    await scheduler.process_batch("switch", mode="idle")
+    assert vec.count() == 1
+    path = db.db_path
+    db.close()
+    switched = MemoirDB(path, embedding_dim=8, embedding_provider_id="new-provider")
+    switched.initialize()
+    assert switched.fetchone("SELECT COUNT(*) AS n FROM episodes")["n"] == 1
+    assert VecStore(switched).count() == 0
+    assert VecStore(switched).missing_episode_ids() == [1]
+    switched.close()
+    print("✓ 12. provider 变化只重建 vec，保留 episode")
+
+
+async def test_13_semantic_duplicate_skipped():
+    from importlib import import_module
+    ExtractedEvent = import_module(f"{_PKG}.pipeline.extractor").ExtractedEvent
+    db, vec, extractor, writer, scheduler, _ = await build_stack(SimpleGoodProvider())
+    now = int(time.time())
+    raw_ids = []
+    for i in range(2):
+        raw_ids.append(db.insert_raw_message(
+            dedupe_key=f"duplicate:{i}", platform="qq", chat_type="private",
+            session_id="duplicate", group_id=None, platform_message_id=str(i),
+            speaker_id="111", speaker_name="甲", role="user", content="插件故障",
+            reply_to_id=None, trigger_raw_id=None, created_at=now + i,
+        ))
+    for rid in raw_ids:
+        await writer.write_batch(
+            [ExtractedEvent(title="插件故障", content="插件启动失败", source_raw_ids=[rid], keywords=[])],
+            [rid], session_id="duplicate", chat_type="private", group_id=None, platform="qq",
+        )
+    assert db.fetchone("SELECT COUNT(*) AS n FROM episodes")["n"] == 1
+    assert count_unprocessed(db, "duplicate") == 0
+    db.close()
+    print("✓ 13. 高度重复 episode 跳过，同时 raw 正常 processed")
+
+
+async def test_14_embedding_selection_is_strict():
+    from importlib import import_module
+    embedding = import_module(f"{_PKG}.pipeline.embedding")
+    provider = OkEmbeddingProvider(dim=8)
+    context = FakeContext(SimpleGoodProvider(), provider)
+    assert embedding.resolve_embedding_provider(context, "ok") is provider
+
+    class MetaOnlyEmbeddingProvider:
+        def meta(self):
+            return types.SimpleNamespace(id="meta-only", name="测试向量模型")
+        def get_dim(self):
+            return 8
+        async def get_embedding(self, text):
+            return await provider.get_embedding(text)
+
+    meta_only = MetaOnlyEmbeddingProvider()
+    meta_context = FakeContext(SimpleGoodProvider(), meta_only)
+    assert not hasattr(meta_only, "id")
+    assert embedding.resolve_embedding_provider(meta_context, "meta-only") is meta_only
+    assert embedding.provider_display_name(meta_only, "meta-only") == "测试向量模型"
+    assert await embedding.embedding_dimension(meta_only) == 8
+    for invalid in ("", "missing"):
+        try:
+            embedding.resolve_embedding_provider(context, invalid)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"provider {invalid!r} must not fallback")
+    assert await embedding.embedding_dimension(provider) == 8
+    print("✓ 14. 兼容 meta().id、无效 ID 不回退、维度自动探测")
+
+
+async def test_15_late_assistant_idle_flush():
+    db, vec, extractor, writer, scheduler, _ = await build_stack(SimpleGoodProvider())
+    now = int(time.time())
+    user_id = db.insert_raw_message(
+        dedupe_key="late:u", platform="qq", chat_type="group", session_id="late",
+        group_id="g", platform_message_id="u", speaker_id="111", speaker_name="甲",
+        role="user", content="问题", reply_to_id=None, trigger_raw_id=None,
+        created_at=now,
+    )
+    db.mark_processed([user_id], now)
+    reply_id = db.insert_raw_message(
+        dedupe_key="late:a", platform="qq", chat_type="group", session_id="late",
+        group_id="g", platform_message_id=None, speaker_id="999", speaker_name="星星",
+        role="assistant", content="答案", reply_to_id=None, trigger_raw_id=user_id,
+        created_at=now + 10,
+    )
+    batch = db.get_bounded_batch("late", "group", mode="idle", batch_size=20)
+    assert [r["id"] for r in batch] == [reply_id]
+    await scheduler.process_batch("late", mode="idle")
+    assert count_unprocessed(db, "late") == 0
+    db.close()
+    print("✓ 15. 已处理 inbound 的迟到回复仍能 idle 消化")
+
+
+async def test_16_invalid_extract_provider_never_falls_back():
+    class CountingLLM:
+        calls = 0
+        async def text_chat(self, **kwargs):
+            self.calls += 1
+            return FakeLLMResponse('{"events":[]}')
+
+    llm = CountingLLM()
+    db, vec, extractor, writer, scheduler, _ = await build_stack(llm)
+    class MissingSelectedProvider(FakeContext):
+        def get_provider_by_id(self, pid): return None
+    extractor.context = MissingSelectedProvider(llm, OkEmbeddingProvider())
+    extractor.extract_provider_id = "missing-extract-provider"
+    rid = db.insert_raw_message(
+        dedupe_key="invalid-extract", platform="qq", chat_type="private",
+        session_id="extract", group_id=None, platform_message_id="1",
+        speaker_id="111", speaker_name="甲", role="user", content="测试",
+        reply_to_id=None, trigger_raw_id=None, created_at=int(time.time()),
+    )
+    await scheduler.process_batch("extract", mode="idle")
+    assert llm.calls == 0
+    assert count_unprocessed(db, "extract") == 1
+    db.close()
+    print("✓ 16. 无效 extract provider 不调用主 provider，raw 保持未处理")
+
+
+async def test_17_panel_invalid_fts_query_falls_back():
+    from importlib import import_module
+    from astrbot.api.web import request
+    panel_mod = import_module(f"{_PKG}.pipeline.panel")
+    db, vec, extractor, writer, scheduler, _ = await build_stack(SimpleGoodProvider())
+    now = int(time.time())
+    eid = db.insert_episode(
+        platform="qq", chat_type="private", session_id="search", group_id=None,
+        title="插件/故障", content="插件/故障处理好了", source_raw_ids=[],
+        event_start_at=now, event_end_at=now, extracted_at=now,
+    )
+    db.insert_participants(eid, [{"speaker_id": "111", "speaker_name": "甲", "role": "user"}])
+    db.insert_fts(eid, "插件/故障", "插件/故障处理好了", [])
+    request.query = {"q": "插件/故障", "participant": "111", "chat_type": "private"}
+    panel = panel_mod.MemoirPanel(db, vec, None, scheduler, writer,
+                                  writer.embedding_provider, "ok", 8)
+    result = await panel.list_episodes()
+    assert result["status"] == "ok", result
+    assert [e["id"] for e in result["data"]] == [eid], result
+    request.query = {}
+    db.close()
+    print("✓ 17. Panel 非法 FTS 语法退回字面搜索，仍保留参与者筛选")
+
+
 # ============================================================
 # Main
 # ============================================================
@@ -494,9 +705,18 @@ async def main():
     await test_6_hallucinated_raw_id_rejected()
     await test_7_missing_group_id_returns_empty()
     await test_8_parallel_sessions_no_conflict()
+    await test_9_group_same_second_and_late_reply()
+    await test_10_idle_chunks_and_repair()
+    await test_11_partial_invalid_is_atomic()
+    await test_12_provider_switch_rebuilds_only_vectors()
+    await test_13_semantic_duplicate_skipped()
+    await test_14_embedding_selection_is_strict()
+    await test_15_late_assistant_idle_flush()
+    await test_16_invalid_extract_provider_never_falls_back()
+    await test_17_panel_invalid_fts_query_falls_back()
 
     print()
-    print("========== ALL 8 PHASE 1F-FIX TESTS PASSED ==========")
+    print("========== ALL 17 PHASE 1F-FIX TESTS PASSED ==========")
 
 
 if __name__ == "__main__":

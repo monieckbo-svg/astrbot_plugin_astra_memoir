@@ -1,17 +1,12 @@
 """
 astrbot_plugin_astra_memoir — Astra 的自动记忆库
 
-Phase 1d 完整装配：
-- storage (SQLite + sqlite-vec)
-- raw_cache (消息入库)
-- scheduler (60s 轮询 + per-session lock)
-- extractor (LLM 事件拆分)
-- writer (episode 落库 + embedding)
-
-Phase 1e 待补：retriever（检索 + on_llm_request 注入）
+完整装配：消息缓存、分块事件提取、episode/FTS/向量存储、检索注入，
+以及管理面板和缺失向量修复。
 """
 from __future__ import annotations
 
+import asyncio
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import EventMessageType
@@ -27,9 +22,9 @@ from .pipeline import (
     SchedulerConfig,
     Retriever,
     RetrieverConfig,
-    MemoirPanel,
-    register_panel_routes,
 )
+from .pipeline.embedding import resolve_embedding_provider, embedding_dimension
+from .pipeline.panel import MemoirPanel, register_panel_routes
 
 
 PLUGIN_NAME = "astrbot_plugin_astra_memoir"
@@ -48,7 +43,6 @@ class AstraMemoir(Star):
         self.config = config or {}
 
         # ---- 读配置 ----
-        embedding_dim = int(self._cfg("embedding_dim", 1024))
         bot_display_name = str(self._cfg("bot_display_name", "星星"))
         extract_provider_id = str(self._cfg("extract_provider_id", ""))
         embedding_provider_id = str(self._cfg("embedding_provider_id", ""))
@@ -70,42 +64,69 @@ class AstraMemoir(Star):
             enable_group_recall_in_private=bool(
                 self._cfg("enable_group_recall_in_private", True)
             ),
+            cross_group_owner_ids=frozenset(
+                x.strip() for x in str(self._cfg("cross_group_owner_ids", "")).replace("，", ",").split(",") if x.strip()
+            ),
         )
 
-        # ---- 初始化 DB ----
+        # ---- 异步初始化：先确定 provider/dim，才能创建 vec 表 ----
         data_dir = StarTools.get_data_dir(PLUGIN_NAME)
         db_path = data_dir / "memoir.db"
         logger.info("[Memoir] DB path: %s", db_path)
+        self.db = None
+        self.scheduler = None
+        self.startup_error = None
+        self._startup_task = asyncio.create_task(self._initialize(
+            context, db_path, embedding_provider_id, extract_provider_id,
+            bot_display_name, sched_cfg, retr_cfg,
+        ))
 
-        self.db = MemoirDB(db_path, embedding_dim=embedding_dim)
-        self.db.initialize()
-        self.vec = VecStore(self.db)
-
-        # ---- 装配 pipeline ----
-        self.raw_cache = RawCache(self.db, bot_display_name=bot_display_name)
-        self.extractor = EventExtractor(context, self.db, extract_provider_id)
-        self.writer = EpisodeWriter(context, self.db, self.vec, embedding_provider_id)
-        self.scheduler = BatchScheduler(self.db, self.extractor, self.writer, sched_cfg)
-        self.retriever = Retriever(
-            context, self.db, self.vec, retr_cfg, embedding_provider_id
-        )
-
-        # ---- 装配管理面板 + 注册 HTTP endpoint ----
-        self.panel = MemoirPanel(self.db, self.vec, self.retriever, self.scheduler)
+    async def _initialize(self, context, db_path, embedding_provider_id,
+                          extract_provider_id, bot_display_name, sched_cfg, retr_cfg):
         try:
+            provider = resolve_embedding_provider(context, embedding_provider_id)
+            dim = await embedding_dimension(provider)
+            # Probe even when get_dim() succeeds: fail early on broken credentials.
+            probe = await provider.get_embedding("memoir startup probe")
+            if len(probe) != dim:
+                raise RuntimeError(f"Embedding provider 维度不一致: get_dim={dim}, probe={len(probe)}")
+            self.db = MemoirDB(db_path, embedding_dim=dim,
+                               embedding_provider_id=embedding_provider_id)
+            self.db.initialize()
+            self.vec = VecStore(self.db)
+            self.raw_cache = RawCache(self.db, bot_display_name=bot_display_name)
+            self.extractor = EventExtractor(context, self.db, extract_provider_id)
+            self.writer = EpisodeWriter(provider, self.db, self.vec)
+            self.scheduler = BatchScheduler(self.db, self.extractor, self.writer, sched_cfg)
+            self.retriever = Retriever(provider, self.db, self.vec, retr_cfg)
+            self.panel = MemoirPanel(self.db, self.vec, self.retriever, self.scheduler,
+                                     self.writer, provider, embedding_provider_id, dim)
             register_panel_routes(context, self.panel)
-        except Exception:
-            logger.exception("[Memoir] 面板路由注册失败，其他功能不受影响")
+            repaired = await self.writer.reindex_missing_vectors()
+            logger.info("[Memoir] startup vector repair: %s", repaired)
+            self.scheduler.start()
+            logger.info("[Memoir] 插件加载完成 (embedding_provider=%s, dim=%d)",
+                        embedding_provider_id, dim)
+        except Exception as e:
+            self.startup_error = str(e)
+            logger.exception("[Memoir] 初始化失败: %s", e)
+            if self.scheduler:
+                await self.scheduler.stop()
+            # Configuration errors stay visible in the Plugin Page status tab.
+            if not hasattr(self, "panel"):
+                async def h_status_error():
+                    return {"status": "error", "message": self.startup_error}
+                try:
+                    context.register_web_api(
+                        f"/{PLUGIN_NAME}/stats", h_status_error, methods=["GET"],
+                        desc="Memoir startup error",
+                    )
+                except Exception:
+                    logger.exception("[Memoir] 无法注册启动错误状态端点")
 
-        # ---- 起后台调度 ----
-        self.scheduler.start()
-
-        logger.info(
-            "[Memoir] 插件加载完成 (embedding_dim=%d, extract_provider=%r, "
-            "top_k=%d, max_cosine_distance=%.2f)",
-            embedding_dim, extract_provider_id or "(using_provider)",
-            retr_cfg.top_k, retr_cfg.max_cosine_distance,
-        )
+    async def _ready(self) -> bool:
+        await self._startup_task
+        return self.startup_error is None
 
     def _cfg(self, key: str, default):
         """兼容 dict / AstrBotConfig 两种配置形态。"""
@@ -124,7 +145,8 @@ class AstraMemoir(Star):
         所有用户消息入 raw cache（包括群里非 @Astra 的普通消息）。
         speaker_id = event.get_sender_id()（QQ 号，稳定主键）
         """
-        await self.raw_cache.record_user_message(event)
+        if await self._ready():
+            await self.raw_cache.record_user_message(event)
 
     @filter.on_llm_response()
     async def on_astra_reply(self, event: AstrMessageEvent, resp: LLMResponse):
@@ -134,7 +156,8 @@ class AstraMemoir(Star):
         trigger_raw_id = 反查触发本次 LLM 的用户 raw
         反查不到 → warning + skip
         """
-        await self.raw_cache.record_assistant_reply(event, resp)
+        if await self._ready():
+            await self.raw_cache.record_assistant_reply(event, resp)
 
     @filter.on_llm_request()
     async def on_before_llm(self, event: AstrMessageEvent, req):
@@ -143,7 +166,8 @@ class AstraMemoir(Star):
         用 req.extra_user_content_parts + mark_as_temp（v4 官方姿势），
         不动 system_prompt / prompt / contexts，保护 prompt cache。
         """
-        await self.retriever.inject(event, req)
+        if await self._ready():
+            await self.retriever.inject(event, req)
 
     # ==========================================================
     # Lifecycle
@@ -151,12 +175,15 @@ class AstraMemoir(Star):
 
     async def terminate(self):
         """插件卸载：停调度，关 DB。"""
+        await self._startup_task
         try:
-            await self.scheduler.stop()
+            if self.scheduler:
+                await self.scheduler.stop()
         except Exception:
             logger.exception("[Memoir] scheduler.stop 异常")
         try:
-            self.db.close()
+            if self.db:
+                self.db.close()
         except Exception:
             logger.exception("[Memoir] db.close 异常")
         logger.info("[Memoir] 插件已卸载")

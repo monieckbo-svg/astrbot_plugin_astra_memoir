@@ -62,7 +62,9 @@ git pull
 | 字段 | 说明 |
 |---|---|
 | `extract_provider_id` | 事件拆分 LLM provider ID（**强烈建议先建一个便宜快的 provider 如 DeepSeek Flash**，别用跟星星聊天的主 provider 抢配额） |
-| `embedding_provider_id` | Embedding provider ID（留空 = 用第一个可用的，`BAAI/bge-large-zh-v1.5` 就行） |
+| `embedding_provider_id` | 必须从已配置的 Embedding provider 中选择；插件会自动获取维度并补齐缺失向量 |
+
+如需在私聊召回群聊记忆，把 owner QQ 填入 `cross_group_owner_ids`；留空时私聊用户只能查自己的私聊记忆。
 
 其他可以先用默认。想调优时看：
 
@@ -78,7 +80,7 @@ git pull
 
 ```
 [Memoir] DB path: /path/to/data/plugin_data/astrbot_plugin_astra_memoir/memoir.db
-[Memoir] 插件加载完成 (embedding_dim=1024, extract_provider='...', top_k=4, max_cosine_distance=0.90)
+[Memoir] 插件加载完成 (embedding_provider=..., dim=1024)
 [Memoir] scheduler 已启动 (interval=60s)
 ```
 
@@ -147,7 +149,7 @@ sqlite3 $DB "SELECT COUNT(*) FROM episode_vec;"
 **做**：
 - 私聊事件 + 群聊事件消化
 - 语义 + FTS 混合检索
-- 私聊召回群聊；群聊隔离私聊
+- owner allowlist 中的私聊用户可召回群聊；群聊隔离私聊
 - 每人的话严格归属（QQ 号做身份主键）
 - 30 天原文 TTL
 

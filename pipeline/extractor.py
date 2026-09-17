@@ -74,7 +74,7 @@ _SYSTEM_PROMPT_PRIVATE = """你是记忆系统的事件提取器，只输出严�
 3. 每个事件必须能脱离本批次独立理解，保留具体人、物、名称、数字、决定和结果。
 4. 不要生成"聊了生活"、"讨论了各种话题"这种空泛摘要。
 5. 单纯的"哈哈哈"、表情、寒暄没有值得记忆的内容时，返回 events=[]。
-6. 消息中的 [raw_id=N] 是内部标识，输出的 source_raw_ids 必须只包含 <new_messages> 标记内的 raw_id，不能只用 <context_only> 里的。
+6. source_raw_ids 可引用 <context_only> 和 <new_messages> 中与事件直接相关的 raw_id，但至少包含一个 <new_messages> raw_id；严禁引用本批之外的 raw_id。
 7. keywords 是 2~5 个中文关键词，用于后续检索命中。
 
 【第一人称记事】
@@ -103,7 +103,7 @@ _SYSTEM_PROMPT_GROUP = """你是记忆系统的事件提取器，只输出严格
 4. 每个事件必须能脱离本批次独立理解，保留具体人、物、名称、数字、决定和结果。
 5. 不要生成"群里聊了各种话题"这种空泛摘要。
 6. 单纯的"哈哈哈"、表情、寒暄没有值得记忆的内容时，返回 events=[]。
-7. 消息中的 [raw_id=N] 是内部标识，输出的 source_raw_ids 必须只包含 <new_messages> 标记内的 raw_id。
+7. source_raw_ids 可引用 <context_only> 和 <new_messages> 中与事件直接相关的 raw_id，但至少包含一个 <new_messages> raw_id；严禁引用本批之外的 raw_id。
 8. keywords 是 2~5 个中文关键词，用于后续检索命中。
 
 【第一人称记事】
@@ -296,11 +296,11 @@ def parse_llm_response(
         ))
 
     # LLM 明明返回了事件但全部被过滤 → 视为失败，保持 raw unprocessed
-    if raw_events and not valid:
+    if rejected:
         return ExtractResult(
             success=False,
             events=[],
-            error=f"all {rejected} event(s) rejected by hard rules",
+            error=f"{rejected} event(s) rejected by hard rules; whole batch refused",
             raw_event_count=len(raw_events),
             rejected_count=rejected,
         )
@@ -334,11 +334,11 @@ class EventExtractor:
         if self.extract_provider_id:
             prov = self.context.get_provider_by_id(self.extract_provider_id)
             if prov is None:
-                logger.warning(
-                    "[Memoir] extract_provider_id=%r 找不到 provider，回退到 using_provider",
+                logger.error(
+                    "[Memoir] extract_provider_id=%r 找不到 provider，拒绝本批提取",
                     self.extract_provider_id,
                 )
-            return prov or self.context.get_using_provider()
+            return prov
         return self.context.get_using_provider()
 
     async def extract(
@@ -355,8 +355,10 @@ class EventExtractor:
 
         provider = self._get_provider()
         if provider is None:
-            logger.error("[Memoir] 没有可用的 LLM provider，跳过本批")
-            return ExtractResult(success=False, error="no LLM provider available")
+            error = (f"configured extract provider unavailable: {self.extract_provider_id}"
+                     if self.extract_provider_id else "no LLM provider available")
+            logger.error("[Memoir] %s，跳过本批", error)
+            return ExtractResult(success=False, error=error)
 
         system_prompt = _SYSTEM_PROMPT_GROUP if chat_type == "group" else _SYSTEM_PROMPT_PRIVATE
         user_prompt = build_user_prompt(new_msgs, overlap_msgs, chat_type)
@@ -368,19 +370,22 @@ class EventExtractor:
             chat_type, len(new_msgs), len(overlap_msgs),
         )
 
-        try:
-            resp = await provider.text_chat(
-                prompt=user_prompt,
-                system_prompt=system_prompt,
-            )
-        except Exception as e:
-            logger.exception("[Memoir] LLM 事件提取调用失败: %s", e)
-            return ExtractResult(success=False, error=f"LLM call: {e}")
+        for attempt in range(2):
+            try:
+                resp = await provider.text_chat(
+                    prompt=user_prompt if attempt == 0 else user_prompt + "\n上次输出有无效事件。请重新输出完整 JSON，确保每个事件都满足全部 raw_id 硬规则。",
+                    system_prompt=system_prompt,
+                )
+            except Exception as e:
+                logger.exception("[Memoir] LLM 事件提取调用失败: %s", e)
+                return ExtractResult(success=False, error=f"LLM call: {e}")
 
-        text = getattr(resp, "completion_text", None) or ""
-        result = parse_llm_response(
-            text, new_msg_ids=new_msg_ids, overlap_msg_ids=overlap_msg_ids,
-        )
+            text = getattr(resp, "completion_text", None) or ""
+            result = parse_llm_response(
+                text, new_msg_ids=new_msg_ids, overlap_msg_ids=overlap_msg_ids,
+            )
+            if result.success or not result.rejected_count:
+                break
 
         if result.success:
             logger.info(

@@ -130,6 +130,7 @@
 <main>
   <div id="stats" class="tab-content">
     <div class="stats-grid" id="statsGrid"><div class="loading">加载中…</div></div>
+    <div class="card"><button onclick="repairVectors()">补齐缺失向量</button><span id="repairResult" style="margin-left:10px"></span></div>
     <div class="card">
       <div style="font-weight:600;margin-bottom:8px">活跃 session（有未处理消息）</div>
       <div id="activeSessions"><div class="loading">加载中…</div></div>
@@ -253,18 +254,22 @@ async function loadStats() {
   const sess = document.getElementById('activeSessions');
   grid.innerHTML = '<div class="loading">加载中…</div>';
   try {
-    const r = await api('/stats');
-    const d = r.data || r;
+    const d = await api('stats');
     const items = [
       ['Episode 总数', d.episodes_total],
       ['今日新增', d.episodes_today],
       ['Raw 总数', d.raw_total],
       ['Raw 未处理', d.raw_unprocessed],
       ['缺失向量', d.vec_missing],
+      ['Vector coverage', `${d.vec_covered} / ${d.episodes_total}`],
+      ['Embedding provider', d.embedding_provider_name],
+      ['Provider ID', d.embedding_provider_id],
+      ['Dimension', d.embedding_dim],
+      ['Embedding 状态', d.embedding_status],
       ['调度器', d.scheduler_running ? '运行中' : '停止'],
     ];
     grid.innerHTML = items.map(([label, n]) =>
-      `<div class="stat"><div class="n">${n}</div><div class="label">${label}</div></div>`
+      `<div class="stat"><div class="n">${escapeHtml(n)}</div><div class="label">${escapeHtml(label)}</div></div>`
     ).join('');
 
     if (d.last_extracted_at) {
@@ -283,7 +288,19 @@ async function loadStats() {
       sess.innerHTML = '<div class="empty">无未处理消息</div>';
     }
   } catch (e) {
-    grid.innerHTML = `<div class="error">${e.message}</div>`;
+    grid.innerHTML = `<div class="error">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function repairVectors() {
+  const result = document.getElementById('repairResult');
+  result.textContent = '修复中…';
+  try {
+    const d = await apiPost('vectors/repair', {});
+    result.textContent = `补齐 ${d.repaired} 条，失败 ${d.failed} 条`;
+    await loadStats();
+  } catch (e) {
+    result.textContent = `修复失败：${e.message}`;
   }
 }
 
@@ -299,8 +316,7 @@ async function loadEpisodes() {
   if (q) params.q = q;
   if (pt) params.participant = pt;
   try {
-    const r = await api('/episodes', params);
-    const eps = r.data || [];
+    const eps = await api('episodes', params);
     if (!eps.length) {
       wrap.innerHTML = '<div class="empty">没有匹配的 episode</div>';
       return;
@@ -328,8 +344,7 @@ async function loadDetail(id) {
   const c = document.getElementById('detailContent');
   c.innerHTML = '<div class="loading">加载中…</div>';
   try {
-    const r = await api(`/episodes/${id}`);
-    const ep = r.data;
+    const ep = await api(`episodes/${id}`);
     if (!ep) { c.innerHTML = '<div class="error">episode 不存在</div>'; return; }
     const dt = new Date(ep.event_start_at * 1000).toLocaleString();
     const tag = ep.chat_type === 'group' ? 'tag-group' : 'tag-private';
@@ -399,8 +414,7 @@ async function loadRaw() {
   if (pr) params.processed = pr;
   if (s) params.session_id = s;
   try {
-    const r = await api('/raw', params);
-    const rows = r.data || [];
+    const rows = await api('raw', params);
     if (!rows.length) {
       wrap.innerHTML = '<div class="empty">没有匹配</div>';
       return;
@@ -440,8 +454,7 @@ async function runDebugRecall() {
     wrap.innerHTML = '<div class="error">请填写 query</div>'; return;
   }
   try {
-    const r = await apiPost('/debug/recall', body);
-    const d = r.data;
+    const d = await apiPost('debug/recall', body);
     const results = d.results || [];
     let html = `<div class="card">
       <div style="font-size:12px;color:var(--muted)">query: ${escapeHtml(d.query)}</div>
@@ -463,7 +476,7 @@ async function runDebugRecall() {
           <div class="ep-meta">${dt} · id=${res.episode_id}</div>
           <div class="ep-content">${escapeHtml(res.content)}</div>
           <div class="ep-parts">参与者：${escapeHtml(res.participants.join('、'))}</div>
-          <div class="result-scores">${vec} · fts_hit=${res.fts_hit} · rrf=${res.rrf_score.toFixed(4)}</div>
+          <div class="result-scores">${vec} · fts_hit=${res.fts_hit} · relevance_passed=${res.relevance_passed} · rrf=${res.rrf_score.toFixed(4)} · participant=${res.participant_bonus.toFixed(4)} · recency=${res.recency_bonus.toFixed(4)} · final=${res.final_score.toFixed(4)}</div>
         </div>`;
       }).join('');
     }

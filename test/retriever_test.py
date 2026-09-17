@@ -253,7 +253,8 @@ async def main():
         embed = ThemeEmbedding()
         context = FakeContext(embed)
         cfg = RetrieverConfig(top_k=5, max_cosine_distance=0.9)
-        retr = Retriever(context, db, vec, cfg, embedding_provider_id="")
+        cfg.cross_group_owner_ids = frozenset({"111"})
+        retr = Retriever(embed, db, vec, cfg)
 
         e1, e2, e3, e4, e5 = await prepare_data(db, vec, embed)
         print(f"prepared episodes: e1={e1} e2={e2} e3={e3} e4={e4} e5={e5}")
@@ -275,6 +276,12 @@ async def main():
         ids = [x.episode_id for x in r]
         assert e3 in ids, f"私聊应召回群聊'小雨感冒'，got {ids}"
         print(f"✓ 场景 2: 私聊召回群聊事件 ({ids})")
+
+        ordinary = await retr.recall(
+            "小雨怎么了", session_id="priv_B", chat_type="private",
+            group_id=None, current_speaker_id="222",
+        )
+        assert e3 not in {x.episode_id for x in ordinary}, "非 owner 私聊不能跨群召回"
 
         # === 3. 私聊不能召回别人的 private ===
         r = await retr.recall(

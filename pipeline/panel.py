@@ -17,12 +17,14 @@ kwargs 传入。要拿 query string / body，用 astrbot.api.web.request module-
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 
 from astrbot.api import logger
 from astrbot.api.web import request as astr_request
 
 from ..storage import MemoirDB, VecStore
+from .embedding import provider_display_name
 from .retriever import Retriever
 
 
@@ -54,11 +56,21 @@ class MemoirPanel:
         vec: VecStore,
         retriever: Retriever,
         scheduler,
+        writer,
+        embedding_provider,
+        embedding_provider_id: str,
+        embedding_dim: int,
     ):
         self.db = db
         self.vec = vec
         self.retriever = retriever
         self.scheduler = scheduler
+        self.writer = writer
+        self.embedding_provider = embedding_provider
+        self.embedding_provider_id = embedding_provider_id
+        self.embedding_dim = embedding_dim
+        import asyncio
+        self._repair_lock = asyncio.Lock()
 
     # ---------- stats ----------
 
@@ -79,7 +91,10 @@ class MemoirPanel:
             raw_unproc = self.db.fetchone(
                 "SELECT COUNT(*) AS n FROM recent_messages WHERE processed_at IS NULL"
             )["n"]
-            missing_vec = len(self.vec.missing_episode_ids(limit=1000))
+            missing_vec = self.db.fetchone(
+                "SELECT COUNT(*) AS n FROM episodes e LEFT JOIN episode_vec v "
+                "ON v.episode_id = e.id WHERE v.episode_id IS NULL"
+            )["n"]
             last_extracted = self.db.fetchone(
                 "SELECT MAX(extracted_at) AS t FROM episodes"
             )["t"]
@@ -94,6 +109,13 @@ class MemoirPanel:
                 "raw_total": raw_total,
                 "raw_unprocessed": raw_unproc,
                 "vec_missing": missing_vec,
+                "vec_covered": episodes_total - missing_vec,
+                "embedding_provider_id": self.embedding_provider_id,
+                "embedding_provider_name": provider_display_name(
+                    self.embedding_provider, self.embedding_provider_id
+                ),
+                "embedding_dim": self.embedding_dim,
+                "embedding_status": "ok",
                 "last_extracted_at": last_extracted,
                 "scheduler_running": self.scheduler._main_task is not None,
                 "active_sessions": [_row_to_dict(r) for r in sessions_active],
@@ -104,6 +126,15 @@ class MemoirPanel:
         except Exception as e:
             logger.exception("[Memoir] get_stats 异常")
             return {"status": "error", "message": str(e), "data": {}}
+
+    async def repair_vectors(self) -> dict:
+        async with self._repair_lock:
+            try:
+                result = await self.writer.reindex_missing_vectors()
+                return {"status": "ok", "data": result}
+            except Exception as e:
+                logger.exception("[Memoir] vector repair failed")
+                return {"status": "error", "message": str(e)}
 
     # ---------- episodes list ----------
 
@@ -136,7 +167,23 @@ class MemoirPanel:
                 conditions.append("group_id = ?")
                 params.append(group_id)
 
-            if participant:
+            if search:
+                sql = (
+                    "SELECT e.* FROM episodes_fts "
+                    "JOIN episodes e ON e.id = episodes_fts.rowid "
+                    "WHERE episodes_fts MATCH ?"
+                )
+                params_final: list = [search]
+                if participant:
+                    sql += (" AND EXISTS (SELECT 1 FROM episode_participants p "
+                            "WHERE p.episode_id = e.id AND p.speaker_id = ?)")
+                    params_final.append(participant)
+                if conditions:
+                    sql += " AND " + " AND ".join(f"e.{c}" for c in conditions)
+                    params_final.extend(params)
+                sql += " ORDER BY e.event_end_at DESC LIMIT ? OFFSET ?"
+                params_final.extend([limit, offset])
+            elif participant:
                 sql_base = (
                     "SELECT DISTINCT e.* FROM episodes e "
                     "JOIN episode_participants p ON p.episode_id = e.id "
@@ -148,18 +195,6 @@ class MemoirPanel:
                     params_base.extend(params)
                 sql = sql_base + " ORDER BY e.event_end_at DESC LIMIT ? OFFSET ?"
                 params_final = [*params_base, limit, offset]
-            elif search:
-                sql = (
-                    "SELECT e.* FROM episodes_fts "
-                    "JOIN episodes e ON e.id = episodes_fts.rowid "
-                    "WHERE episodes_fts MATCH ?"
-                )
-                params_final: list = [search]
-                if conditions:
-                    sql += " AND " + " AND ".join(f"e.{c}" for c in conditions)
-                    params_final.extend(params)
-                sql += " ORDER BY e.event_end_at DESC LIMIT ? OFFSET ?"
-                params_final.extend([limit, offset])
             else:
                 sql = "SELECT * FROM episodes"
                 if conditions:
@@ -167,7 +202,33 @@ class MemoirPanel:
                 sql += " ORDER BY event_end_at DESC LIMIT ? OFFSET ?"
                 params_final = [*params, limit, offset]
 
-            eps = self.db.fetchall(sql, tuple(params_final))
+            try:
+                eps = self.db.fetchall(sql, tuple(params_final))
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                if not search or not any(marker in message for marker in (
+                    "fts5", "syntax error", "unterminated string", "no such column"
+                )):
+                    raise
+                # MATCH parses user input as FTS syntax; arbitrary text may be invalid.
+                # instr() treats the input literally and keeps all other filters.
+                fallback_sql = (
+                    "SELECT e.* FROM episodes e WHERE "
+                    "(instr(e.title, ?) > 0 OR instr(e.content, ?) > 0 OR "
+                    "EXISTS (SELECT 1 FROM episode_keywords k "
+                    "WHERE k.episode_id = e.id AND instr(k.keyword, ?) > 0))"
+                )
+                fallback_params: list = [search, search, search]
+                if participant:
+                    fallback_sql += (" AND EXISTS (SELECT 1 FROM episode_participants p "
+                                     "WHERE p.episode_id = e.id AND p.speaker_id = ?)")
+                    fallback_params.append(participant)
+                if conditions:
+                    fallback_sql += " AND " + " AND ".join(f"e.{c}" for c in conditions)
+                    fallback_params.extend(params)
+                fallback_sql += " ORDER BY e.event_end_at DESC LIMIT ? OFFSET ?"
+                fallback_params.extend([limit, offset])
+                eps = self.db.fetchall(fallback_sql, tuple(fallback_params))
             result = []
             for e in eps:
                 ep_dict = _row_to_dict(e)
@@ -346,6 +407,10 @@ class MemoirPanel:
                         "vec_distance": r.debug_vec_distance,
                         "fts_hit": r.debug_fts_hit,
                         "rrf_score": r.debug_rrf_score,
+                        "participant_bonus": r.debug_participant_bonus,
+                        "recency_bonus": r.debug_recency_bonus,
+                        "final_score": r.debug_final_score,
+                        "relevance_passed": r.debug_relevance_passed,
                     }
                     for r in results
                 ],
@@ -379,6 +444,9 @@ def register_panel_routes(context, panel: MemoirPanel):
     async def h_debug_recall():
         return await panel.debug_recall()
 
+    async def h_repair_vectors():
+        return await panel.repair_vectors()
+
     context.register_web_api(
         f"{_ROUTE_PREFIX}/stats", h_stats, methods=["GET"],
         desc="Memoir status: episode 总数、今日、未处理 raw 等",
@@ -400,4 +468,9 @@ def register_panel_routes(context, panel: MemoirPanel):
         desc="Memoir retrieval simulator (debug)",
     )
 
-    logger.info("[Memoir] panel API endpoints registered (5 routes)")
+    context.register_web_api(
+        f"{_ROUTE_PREFIX}/vectors/repair", h_repair_vectors, methods=["POST"],
+        desc="Memoir repair missing vectors",
+    )
+
+    logger.info("[Memoir] panel API endpoints registered (6 routes)")

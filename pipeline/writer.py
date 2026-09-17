@@ -18,9 +18,10 @@ pipeline/writer.py — 事件落库
 from __future__ import annotations
 
 import time
+import math
+import struct
 
 from astrbot.api import logger
-from astrbot.api.star import Context
 
 from ..storage import MemoirDB, VecStore
 from .extractor import ExtractedEvent
@@ -36,40 +37,57 @@ class EpisodeWriter:
 
     def __init__(
         self,
-        context: Context,
+        embedding_provider,
         db: MemoirDB,
         vec: VecStore,
-        embedding_provider_id: str = "",
     ):
-        self.context = context
+        self.embedding_provider = embedding_provider
         self.db = db
         self.vec = vec
-        self.embedding_provider_id = embedding_provider_id.strip()
 
     # ---------- Embedding ----------
 
-    def _get_embedding_provider(self):
-        if self.embedding_provider_id:
-            for prov in self.context.get_all_embedding_providers():
-                if getattr(prov, "id", None) == self.embedding_provider_id:
-                    return prov
-            logger.warning(
-                "[Memoir] embedding_provider_id=%r 找不到，回退到第一个可用",
-                self.embedding_provider_id,
-            )
-        providers = self.context.get_all_embedding_providers()
-        return providers[0] if providers else None
-
     async def _embed(self, text: str) -> list[float] | None:
-        prov = self._get_embedding_provider()
-        if prov is None:
-            logger.error("[Memoir] 没有可用的 embedding provider")
-            return None
         try:
-            return await prov.get_embedding(text)
+            embedding = await self.embedding_provider.get_embedding(text)
+            if len(embedding) != self.db.embedding_dim:
+                raise ValueError(f"embedding dimension {len(embedding)} != {self.db.embedding_dim}")
+            return embedding
         except Exception:
             logger.exception("[Memoir] embedding 生成失败")
             return None
+
+    async def reindex_missing_vectors(self, batch_size: int = 50) -> dict:
+        """Repair missing vectors in bounded pages; preserve episodes on failures."""
+        repaired = failed = 0
+        last_id = 0
+        while True:
+            def _load():
+                return self.db.fetchall(
+                    "SELECT e.id, e.title, e.content, e.chat_type, e.session_id, e.group_id "
+                    "FROM episodes e LEFT JOIN episode_vec v ON v.episode_id = e.id "
+                    "WHERE v.episode_id IS NULL AND e.id > ? ORDER BY e.id LIMIT ?",
+                    (last_id, batch_size),
+                )
+            rows = await self.db.run(_load)
+            if not rows:
+                break
+            for row in rows:
+                last_id = row["id"]
+                embedding = await self._embed(f"{row['title']}\n{row['content']}")
+                if embedding is None:
+                    failed += 1
+                    continue
+                try:
+                    await self.db.run(lambda row=row, embedding=embedding: self.vec.upsert(
+                        row["id"], embedding, chat_type=row["chat_type"],
+                        session_id=row["session_id"], group_id=row["group_id"],
+                    ))
+                    repaired += 1
+                except Exception:
+                    logger.exception("[Memoir] vector repair failed for episode %d", row["id"])
+                    failed += 1
+        return {"repaired": repaired, "failed": failed}
 
     # ---------- write_batch ----------
 
@@ -162,9 +180,26 @@ class EpisodeWriter:
             })
 
         def _tx_write():
-            written_ids: list[int] = []
+            written: list[tuple[int, int]] = []
+            accepted_embeddings: list[list[float]] = []
             with self.db.transaction():
-                for ev, pp in zip(events, prepared):
+                for index, (ev, pp, emb) in enumerate(zip(events, prepared, embeddings)):
+                    packed = struct.pack(f"{len(emb)}f", *emb)
+                    duplicate = self.db.fetchone(
+                        "SELECT e.id FROM episodes e JOIN episode_vec v ON v.episode_id = e.id "
+                        "WHERE e.session_id = ? AND e.event_end_at BETWEEN ? AND ? "
+                        "AND vec_distance_cosine(v.embedding, ?) <= 0.025 "
+                        "ORDER BY e.id DESC LIMIT 1",
+                        (session_id, pp["event_end_at"] - 86400,
+                         pp["event_end_at"] + 86400, packed),
+                    )
+                    if duplicate or any(
+                        1 - sum(a*b for a, b in zip(emb, old)) /
+                        (math.sqrt(sum(a*a for a in emb) * sum(b*b for b in old)) or 1) <= 0.025
+                        for old in accepted_embeddings
+                    ):
+                        logger.info("[Memoir] duplicate episode skipped: %s", ev.title)
+                        continue
                     eid = self.db.insert_episode(
                         platform=platform,
                         chat_type=chat_type,
@@ -180,15 +215,18 @@ class EpisodeWriter:
                     self.db.insert_participants(eid, pp["participants"])
                     self.db.insert_keywords(eid, ev.keywords)
                     self.db.insert_fts(eid, ev.title, ev.content, ev.keywords)
-                    written_ids.append(eid)
+                    written.append((eid, index))
+                    accepted_embeddings.append(emb)
                 # 同一 transaction 里标 raw processed
                 self.db.mark_processed(raw_ids_to_mark, extracted_at)
-            return written_ids
+            return written
 
-        episode_ids = await self.db.run(_tx_write)
+        written = await self.db.run(_tx_write)
+        episode_ids = [eid for eid, _ in written]
 
         # 4. transaction 外写 vec —— 失败不删 episode
-        for eid, ev, emb in zip(episode_ids, events, embeddings):
+        for eid, index in written:
+            emb = embeddings[index]
             def _vec_upsert(eid=eid, emb=emb):
                 self.vec.upsert(
                     eid, emb,

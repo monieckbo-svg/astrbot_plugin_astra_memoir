@@ -33,9 +33,10 @@ class MemoirDB:
     - `close()`: 关闭连接
     """
 
-    def __init__(self, db_path: Path, embedding_dim: int = 1024):
+    def __init__(self, db_path: Path, embedding_dim: int, embedding_provider_id: str = ""):
         self.db_path = db_path
         self.embedding_dim = embedding_dim
+        self.embedding_provider_id = embedding_provider_id
         self._conn: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()  # 用于并发写入的粗粒度保护
 
@@ -70,6 +71,16 @@ class MemoirDB:
         schema_sql = _SCHEMA_SQL_PATH.read_text(encoding="utf-8")
         conn.executescript(schema_sql)
 
+        previous = dict(conn.execute("SELECT key, value FROM meta WHERE key IN ('embedding_dim', 'embedding_provider_id')").fetchall())
+        vec_exists = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'episode_vec'").fetchone() is not None
+        # 旧版本没有 provider 元信息时必须重建，避免混用不同模型的向量。
+        changed = vec_exists and (
+            previous.get("embedding_dim") != str(self.embedding_dim)
+            or previous.get("embedding_provider_id") != self.embedding_provider_id
+        )
+        if changed:
+            conn.execute("DROP TABLE episode_vec")
+
         # 创建 vec0 虚拟表（含 metadata 列用于 KNN 阶段可见性过滤）
         # sqlite-vec v0.1.6+ 支持 metadata columns
         conn.execute(
@@ -84,10 +95,10 @@ class MemoirDB:
             """
         )
 
-        # 存 embedding_dim 到 meta，便于以后校验
-        conn.execute(
+        conn.executemany(
             "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
-            ("embedding_dim", str(self.embedding_dim)),
+            [("embedding_dim", str(self.embedding_dim)),
+             ("embedding_provider_id", self.embedding_provider_id)],
         )
 
         self._conn = conn
@@ -229,16 +240,12 @@ class MemoirDB:
         - "threshold":
             私聊 → 最早 N 个 completed user turn（有 assistant reply）+ 它们的 assistant
                    trailing 未闭合的 user 留下一批
-            群聊 → 最早 N 条 inbound 群消息 + 时间区间内 Astra 的回复
+            群聊 → 最早 N 条 inbound 群消息 + 由这些消息触发的 Astra 回复
         - "idle":
-            私聊 / 群聊 → 拉所有未处理（包括未闭合的 user）
-                          消化完就重置
+            私聊 / 群聊 → 同样按 N 条 inbound 分块，私聊允许未闭合的 user
 
         私聊 threshold 关键：不把最后一条还没等到 assistant reply 的 user 纳入 batch。
         """
-        if mode == "idle":
-            return self.get_unprocessed_by_session(session_id)
-
         if chat_type == "private":
             # 找最早 batch_size 个 completed user turn 的 id
             completed_ids_rows = self.fetchall(
@@ -248,17 +255,24 @@ class MemoirDB:
                 WHERE u.session_id = ?
                   AND u.role = 'user'
                   AND u.processed_at IS NULL
-                  AND EXISTS (
+                  AND (? = 'idle' OR EXISTS (
                       SELECT 1 FROM recent_messages a
                       WHERE a.trigger_raw_id = u.id
                         AND a.role = 'assistant'
-                  )
-                ORDER BY u.created_at ASC
+                  ))
+                ORDER BY u.created_at ASC, u.id ASC
                 LIMIT ?
                 """,
-                (session_id, batch_size),
+                (session_id, mode, batch_size),
             )
             if not completed_ids_rows:
+                if mode == "idle":
+                    return self.fetchall(
+                        "SELECT * FROM recent_messages WHERE session_id = ? "
+                        "AND processed_at IS NULL AND role = 'assistant' "
+                        "ORDER BY created_at ASC, id ASC LIMIT ?",
+                        (session_id, batch_size),
+                    )
                 return []
             user_ids = [r["id"] for r in completed_ids_rows]
             # 拉这些 user + 它们的 assistant
@@ -272,34 +286,41 @@ class MemoirDB:
                       id IN ({placeholders})
                       OR trigger_raw_id IN ({placeholders})
                   )
-                ORDER BY created_at ASC
+                ORDER BY created_at ASC, id ASC
                 """,
                 tuple([session_id, *user_ids, *user_ids]),
             )
 
-        # group threshold: 最早 batch_size 条 inbound + 时间区间内 assistant
+        # group: 精确绑定 inbound raw ids，不能按秒级时间窗口圈选。
         inbound_rows = self.fetchall(
             """
-            SELECT id, created_at FROM recent_messages
+            SELECT id FROM recent_messages
             WHERE session_id = ? AND processed_at IS NULL
               AND role = 'user' AND chat_type = 'group'
-            ORDER BY created_at ASC
+            ORDER BY created_at ASC, id ASC
             LIMIT ?
             """,
             (session_id, batch_size),
         )
         if not inbound_rows:
+            if mode == "idle":
+                return self.fetchall(
+                    "SELECT * FROM recent_messages WHERE session_id = ? "
+                    "AND processed_at IS NULL AND role = 'assistant' "
+                    "ORDER BY created_at ASC, id ASC LIMIT ?",
+                    (session_id, batch_size),
+                )
             return []
-        first_ts = inbound_rows[0]["created_at"]
-        last_ts = inbound_rows[-1]["created_at"]
+        inbound_ids = [r["id"] for r in inbound_rows]
+        placeholders = ",".join("?" * len(inbound_ids))
         return self.fetchall(
-            """
+            f"""
             SELECT * FROM recent_messages
             WHERE session_id = ? AND processed_at IS NULL
-              AND created_at >= ? AND created_at <= ?
-            ORDER BY created_at ASC
+              AND (id IN ({placeholders}) OR trigger_raw_id IN ({placeholders}))
+            ORDER BY created_at ASC, id ASC
             """,
-            (session_id, first_ts, last_ts),
+            tuple([session_id, *inbound_ids, *inbound_ids]),
         )
 
     def get_active_sessions_with_unprocessed(self) -> list[sqlite3.Row]:

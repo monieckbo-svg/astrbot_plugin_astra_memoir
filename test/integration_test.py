@@ -231,7 +231,7 @@ async def main():
 
         raw = RawCache(db, bot_display_name="星星")
         extractor = EventExtractor(context, db, extract_provider_id="")
-        writer = EpisodeWriter(context, db, vec, embedding_provider_id="")
+        writer = EpisodeWriter(embed, db, vec)
         cfg = SchedulerConfig(interval_seconds=1, private_batch_user_turns=2)
         scheduler = BatchScheduler(db, extractor, writer, cfg)
 
@@ -244,15 +244,19 @@ async def main():
             ("qq:priv:p4", "assistant", "999", "星星", None, "好像还没修", None),
         ]
         now = int(time.time())
+        trigger_id = None
         for i, (key, role, sid, sname, pmid, content, trg) in enumerate(raws):
-            db.insert_raw_message(
+            inserted_id = db.insert_raw_message(
                 dedupe_key=key, platform="qq", chat_type="private",
                 session_id=priv_sess, group_id=None,
                 platform_message_id=pmid,
                 speaker_id=sid, speaker_name=sname, role=role,
                 content=content, reply_to_id=None,
-                trigger_raw_id=trg, created_at=now + i,
+                trigger_raw_id=trigger_id if role == "assistant" else None,
+                created_at=now + i,
             )
+            if role == "user":
+                trigger_id = inserted_id
 
         # -------- 触发 process_batch --------
         await scheduler.process_batch(priv_sess)

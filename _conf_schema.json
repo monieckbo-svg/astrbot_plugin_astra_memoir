@@ -8,9 +8,12 @@
     "obvious_hint": true
   },
   "embedding_provider_id": {
-    "description": "Embedding provider ID（留空 = 用第一个可用的 embedding provider，正常情况留空就行）",
+    "description": "记忆向量模型",
     "type": "string",
-    "default": ""
+    "default": "",
+    "_special": "select_provider_embedding",
+    "hint": "必须选择一个已经在 AstrBot 中配置并测试成功的 Embedding 模型。Memoir 不再自动使用第一个 provider。",
+    "obvious_hint": true
   },
   "bot_display_name": {
     "description": "星星在记忆里的显示名（QQ 号自动通过 event.get_self_id() 获取，不需要手填）",
@@ -63,14 +66,14 @@
     "default": 0.9
   },
   "enable_group_recall_in_private": {
-    "description": "私聊时能否召回群聊事件（默认开）。群聊召回私聊永远关闭，防止群里泄漏隐私",
+    "description": "允许名单中的私聊用户跨群召回群聊事件。其他私聊用户只可查自己的私聊记忆",
     "type": "bool",
     "default": true
   },
-  "embedding_dim": {
-    "description": "Embedding 向量维度（bge-large-zh-v1.5 是 1024，改模型时才需改）",
-    "type": "int",
-    "default": 1024
+  "cross_group_owner_ids": {
+    "description": "允许跨群召回的 owner QQ 号，多个用英文逗号分隔；留空则所有私聊都不能跨群召回",
+    "type": "string",
+    "default": ""
   },
   "scheduler_interval_seconds": {
     "description": "后台调度器多少秒扫一次会话（判断是否 idle flush）",

@@ -345,12 +345,12 @@ sqlite-vec KNN 返回 `distance`（越小越近）。代码统一用 **`cosine_d
 群聊每批附带**上一批最后 4 条**作为 `<context_only>`，私聊 **2 条**。硬规则：
 > 每个输出 episode 至少必须引用一个 new_messages 的 raw_id。
 
-代码在事件写入前校验，不满足的事件直接丢弃。旧消息只帮理解上下文，不会被重复消化。
+代码在事件写入前校验；任一事件不满足硬规则则整批重试一次，仍失败时 raw 保持未处理。旧消息只帮理解上下文，不会单独生成新事件。
 
 ### 5.4 幂等约束
 - `process_batch` 加 **per-session asyncio.Lock**
-- 所有落库（episodes / participants / keywords / FTS / vec）在**单个 transaction** 里完成
-- **全部成功**才把 recent_messages 批量标 `processed_at`
+- episodes / participants / keywords / FTS 与 `processed_at` 在**单个 transaction** 里完成；vec 是可重建索引，在 transaction 提交后写入
+- embedding 生成失败时不落库；vec 写入失败时保留 episode，启动修复或面板手动补齐
 - **events=[]** 也标 processed（无有效事件是合法结果，不能死循环重跑）
 - 任一步失败：raw 保持 unprocessed，下次调度再试
 
@@ -389,8 +389,9 @@ for eid in scores:
 ```
 
 ### 6.3 私聊 / 群聊边界（信息可见性）
-- **陆忱 ↔ Astra 私聊时**：召回范围 = 当前私聊 episode ∪ **所有 QQ 群聊 episode**
+- **配置在 `cross_group_owner_ids` 中的 owner 私聊时**：召回范围 = 当前私聊 episode ∪ **所有 QQ 群聊 episode**
   - 所以能问 "上午群里那个插件后来怎么了"
+- 其他私聊用户：仅能召回自己的私聊 episode
 - **Astra 在群里时**：召回范围 = **仅当前群 episode**
   - 不带出任何私聊或其他群
   - 防止群里泄漏隐私
@@ -432,10 +433,7 @@ req.extra_user_content_parts.append(
 
 ## 8. 重复检测（V1 简化）
 
-新事件写入前，用 embedding 余弦距离查最近 3 天内的 episode：
-- `cosine_distance < 0.04`
-- 且 participants 高度重叠
-- 才判定重复，跳过写入
+新事件写入前，用 embedding 余弦距离查同一 session、事件时间相差 1 天内的 episode；距离 ≤ 0.025 判定重复，跳过写入。也比较同批新事件，避免同批重复。raw 仍标记 processed。
 
 **不调用 LLM 判断重复**。误合并比多存一条更难修，V1 宁可多存。
 
@@ -448,7 +446,7 @@ req.extra_user_content_parts.append(
 ```jsonc
 {
   "extract_provider_id":       "事件拆分用哪个 LLM provider ID",
-  "embedding_provider_id":     "Embedding provider ID（留空用第一个可用）",
+  "embedding_provider_id":     "必选的 AstrBot Embedding provider ID",
   // "bot_qq_id" 已删除 —— 用 event.get_self_id() 自动获取
   "bot_display_name":          "星星在记忆里的显示名",
   "private_batch_user_turns":  10,     // 私聊：10 个 user turn
@@ -460,7 +458,7 @@ req.extra_user_content_parts.append(
   "raw_retention_days":        30,
   "retrieval_top_k":           4,
   "enable_group_recall_in_private": true,
-  "embedding_dim":             1024,
+  "cross_group_owner_ids":     "owner QQ，多个用逗号分隔",
   "scheduler_interval_seconds": 60
 }
 ```

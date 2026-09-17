@@ -4,7 +4,6 @@ from .extractor import EventExtractor, ExtractedEvent, ExtractResult
 from .writer import EpisodeWriter, WriteBatchError
 from .scheduler import BatchScheduler, SchedulerConfig
 from .retriever import Retriever, RetrieverConfig, RecallResult
-from .panel import MemoirPanel, register_panel_routes
 
 __all__ = [
     "RawCache",
@@ -18,6 +17,4 @@ __all__ = [
     "Retriever",
     "RetrieverConfig",
     "RecallResult",
-    "MemoirPanel",
-    "register_panel_routes",
 ]

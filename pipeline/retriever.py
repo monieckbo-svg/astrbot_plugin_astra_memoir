@@ -5,7 +5,7 @@ pipeline/retriever.py — 记忆检索 + 注入
 
 - query 用 event.get_message_str()，不用被其他插件改写的 req.prompt
 - 可见性硬规则:
-  * 私聊场景: 本 private session + 所有 group episodes
+  * 私聊场景: 本 private session；配置的 owner 还可检索所有 group episodes
   * 群聊场景: 只当前 group session，任何 private episode 都不得进入候选
 - RRF 融合 vec + FTS 排名，不直接相加原始分数
 - Relevance gate: 语义距离超过阈值 + 无 FTS 命中 → 丢弃
@@ -48,6 +48,7 @@ class RetrieverConfig:
     recency_half_life_days: float = 30.0
     # 私聊召回群聊事件的总开关
     enable_group_recall_in_private: bool = True
+    cross_group_owner_ids: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -62,40 +63,33 @@ class RecallResult:
     debug_vec_distance: float | None
     debug_fts_hit: bool
     debug_rrf_score: float
+    debug_participant_bonus: float = 0.0
+    debug_recency_bonus: float = 0.0
+    debug_final_score: float = 0.0
+    debug_relevance_passed: bool = True
 
 
 class Retriever:
     def __init__(
         self,
-        context: Context,
+        embedding_provider,
         db: MemoirDB,
         vec: VecStore,
         config: RetrieverConfig,
-        embedding_provider_id: str = "",
     ):
-        self.context = context
+        self.embedding_provider = embedding_provider
         self.db = db
         self.vec = vec
         self.config = config
-        self.embedding_provider_id = embedding_provider_id.strip()
 
     # ---------- embedding ----------
 
-    def _get_embedding_provider(self):
-        if self.embedding_provider_id:
-            for p in self.context.get_all_embedding_providers():
-                if getattr(p, "id", None) == self.embedding_provider_id:
-                    return p
-        providers = self.context.get_all_embedding_providers()
-        return providers[0] if providers else None
-
     async def _embed_query(self, query: str) -> list[float] | None:
-        prov = self._get_embedding_provider()
-        if prov is None:
-            logger.warning("[Memoir] retriever: 没有 embedding provider")
-            return None
         try:
-            return await prov.get_embedding(query)
+            embedding = await self.embedding_provider.get_embedding(query)
+            if len(embedding) != self.db.embedding_dim:
+                raise ValueError("query embedding dimension mismatch")
+            return embedding
         except Exception:
             logger.exception("[Memoir] retriever: query embedding 失败")
             return None
@@ -104,10 +98,11 @@ class Retriever:
 
     def _visibility_kwargs(
         self, chat_type: str, session_id: str, group_id: str | None,
+        current_speaker_id: str = "",
     ) -> dict | None:
         """
         根据当前对话场景生成 storage 层可见性参数。
-        - 私聊: 本 session + 所有群（若开关允许）
+        - 私聊: 本 session；仅 owner allowlist 可跨群
         - 群聊: 仅当前群
 
         返回 None 表示"当前场景无法安全召回"（如群聊拿不到 group_id）,
@@ -116,7 +111,8 @@ class Retriever:
         if chat_type == "private":
             return dict(
                 include_session_id=session_id,
-                include_all_groups=self.config.enable_group_recall_in_private,
+                include_all_groups=(self.config.enable_group_recall_in_private
+                                    and current_speaker_id in self.config.cross_group_owner_ids),
             )
         # group
         if group_id is None or not str(group_id).strip():
@@ -142,7 +138,7 @@ class Retriever:
         if not query or not query.strip():
             return []
 
-        vis = self._visibility_kwargs(chat_type, session_id, group_id)
+        vis = self._visibility_kwargs(chat_type, session_id, group_id, current_speaker_id)
         if vis is None:
             # 群聊拿不到 group_id → 直接放弃，绝不注入
             logger.debug(
@@ -237,8 +233,9 @@ class Retriever:
             # participant bonus
             parts = parts_map.get(eid, [])
             part_ids = {p[0] for p in parts}
-            if current_speaker_id and current_speaker_id in part_ids:
-                score += self.config.participant_bonus
+            participant_bonus = (self.config.participant_bonus
+                                 if current_speaker_id and current_speaker_id in part_ids else 0.0)
+            score += participant_bonus
 
             # 时间偏好（轻量 tie-break，不足以让不相关记忆压过相关的）
             days_ago = max(0.0, (now - int(ep["event_end_at"])) / 86400.0)
@@ -257,6 +254,9 @@ class Retriever:
                 debug_vec_distance=vec_dist_map.get(eid),
                 debug_fts_hit=eid in fts_set,
                 debug_rrf_score=rrf_scores[eid],
+                debug_participant_bonus=participant_bonus,
+                debug_recency_bonus=recency,
+                debug_final_score=score,
             )))
 
         scored.sort(key=lambda x: -x[0])
