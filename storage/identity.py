@@ -40,7 +40,8 @@ class IdentityStore:
             "INSERT OR IGNORE INTO identities(qq_id, canonical_name, person_type) VALUES (?, ?, ?)",
             (qq, name, "AI" if role == "assistant" else "human"),
         )
-        if name != qq:
+        card = self.db.fetchone("SELECT canonical_name FROM identities WHERE qq_id = ?", (qq,))
+        if name != card["canonical_name"]:
             self.db.execute(
                 "INSERT OR IGNORE INTO identity_aliases(qq_id, alias) VALUES (?, ?)",
                 (qq, name),
@@ -53,6 +54,14 @@ class IdentityStore:
                 f"SELECT speaker_id, speaker_name, role FROM {table} ORDER BY rowid"
             ):
                 self.observe(row["speaker_id"], row["speaker_name"], row["role"])
+
+    def remove_canonical_aliases(self) -> None:
+        """兼容旧版：正式名字曾被重复写进别名表。"""
+        self.db.execute(
+            "DELETE FROM identity_aliases WHERE EXISTS "
+            "(SELECT 1 FROM identities i WHERE i.qq_id = identity_aliases.qq_id "
+            "AND i.canonical_name = identity_aliases.alias)"
+        )
 
     def get(self, qq_id: Any) -> dict | None:
         try:
@@ -105,7 +114,8 @@ class IdentityStore:
                 raise ValueError("类型只能为 human / AI")
             if not isinstance(aliases, list) or len(aliases) > 100:
                 raise ValueError("别名必须是最多 100 项的数组")
-            cleaned = sorted({str(a).strip() for a in aliases if str(a).strip()})
+            cleaned = sorted({str(a).strip() for a in aliases
+                              if str(a).strip() and str(a).strip() != name})
             if any(len(a) > 100 for a in cleaned):
                 raise ValueError("单个别名不能超过 100 字")
             prepared.append((qq, name, pronoun, person_type, cleaned))
@@ -141,6 +151,8 @@ class IdentityStore:
                 (source, target),
             )
             for alias in {source_card["canonical_name"], *source_card["aliases"]}:
+                if alias == target_card["canonical_name"]:
+                    continue
                 self.db.execute(
                     "INSERT OR IGNORE INTO identity_aliases(qq_id, alias) VALUES (?, ?)",
                     (target, alias),

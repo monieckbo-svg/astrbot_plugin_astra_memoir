@@ -130,6 +130,7 @@ class MemoirDB:
         if self.get_meta("identity_backfill_done") != "1":
             self.identities.backfill()
             self.set_meta("identity_backfill_done", "1")
+        self.identities.remove_canonical_aliases()
 
     def close(self) -> None:
         if self._conn is not None:

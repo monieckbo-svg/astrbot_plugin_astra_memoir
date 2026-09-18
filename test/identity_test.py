@@ -28,14 +28,16 @@ def main():
         card = db.identities.get("111")
         assert card["canonical_name"] == "陆忱"
         assert card["pronoun"] == "TA" and card["person_type"] == "human"
-        assert set(card["aliases"]) == {"陆忱", "喵日天"}
+        assert card["aliases"] == ["喵日天"]
+        assert db.identities.get("222")["aliases"] == []
         assert db.identities.get("222")["person_type"] == "AI"
         assert db.identities.get("222")["pronoun"] == "TA"
 
         db.identities.update_many([{
             "qq_id": "111", "canonical_name": "正式陆忱", "pronoun": "她",
-            "person_type": "human", "aliases": ["陆忱", "喵日天"],
+            "person_type": "human", "aliases": ["陆忱", "喵日天", "正式陆忱"],
         }])
+        assert "正式陆忱" not in db.identities.get("111")["aliases"]
         raw(db, "d", "111", "又一个昵称")
         assert db.identities.get("111")["canonical_name"] == "正式陆忱"
         assert db.identities.get("111")["pronoun"] == "她"
@@ -53,11 +55,15 @@ def main():
         assert db.identities.display("333")[0] == "正式陆忱"
         assert len(db.identities.list_all()) == 2
         assert db.fetchone("SELECT speaker_id FROM recent_messages WHERE dedupe_key='e'")[0] == "333"
+        # 模拟旧版本留下的正式名字重复别名，重启时应自动清理。
+        db.execute("INSERT INTO identity_aliases(qq_id, alias) VALUES (?, ?)",
+                   ("111", "正式陆忱"))
         db.close()
 
         db = MemoirDB(path, embedding_dim=8)
         db.initialize()
         assert db.identities.get("111")["canonical_name"] == "正式陆忱"
+        assert "正式陆忱" not in db.identities.get("111")["aliases"]
         assert db.identities.display("333")[0] == "正式陆忱"
         db.close()
     print("Identity test passed")
