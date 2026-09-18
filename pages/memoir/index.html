@@ -122,6 +122,7 @@
   <nav>
     <button data-tab="stats" class="active">状态</button>
     <button data-tab="episodes">Episodes</button>
+    <button data-tab="identities">人物身份</button>
     <button data-tab="raw">近期原文</button>
     <button data-tab="debug">检索调试</button>
   </nav>
@@ -154,6 +155,22 @@
       <button onclick="loadEpisodes()">筛选</button>
     </div>
     <div id="episodesList"><div class="loading">加载中…</div></div>
+  </div>
+
+  <div id="identities" class="tab-content" hidden>
+    <div class="card">QQ 号是身份主键，昵称只追加为别名。正式名字、代词和类型由你手动维护；新人物默认 TA，不猜性别。合并不会改写历史聊天原文或旧记忆正文。</div>
+    <div class="toolbar">
+      <button onclick="saveIdentities()">保存全部修改</button>
+      <select id="batchPronoun"><option value="">批量代词不变</option><option>TA</option><option>她</option><option>他</option></select>
+      <select id="batchType"><option value="">批量类型不变</option><option value="human">人类</option><option value="AI">AI</option></select>
+      <button onclick="applyIdentityBatch()">应用到勾选人物</button>
+      <span id="identityResult"></span>
+    </div>
+    <div id="identityList"><div class="loading">加载中…</div></div>
+    <div class="card">
+      <b>合并误认的人物</b><p class="ep-meta">将来源 QQ 映射到目标 QQ；目标卡保留，来源昵称并入别名。此操作不改原始 QQ 证据，请先核对 QQ 号。</p>
+      <div class="toolbar"><select id="mergeSource"></select><span>→</span><select id="mergeTarget"></select><button onclick="mergeIdentities()">合并身份</button></div>
+    </div>
   </div>
 
   <div id="detail" class="tab-content" hidden>
@@ -247,11 +264,98 @@ function showTab(name) {
   });
   if (name === 'stats') loadStats();
   if (name === 'episodes') loadEpisodes();
+  if (name === 'identities') loadIdentities();
   if (name === 'raw') loadRaw();
 }
 document.querySelectorAll('nav button').forEach(b => {
   b.onclick = () => showTab(b.dataset.tab);
 });
+
+let identityCards = [];
+async function loadIdentities() {
+  const wrap = document.getElementById('identityList');
+  wrap.innerHTML = '<div class="loading">加载中…</div>';
+  try {
+    identityCards = await api('identities');
+    if (!identityCards.length) {
+      wrap.innerHTML = '<div class="empty">暂无人物；收到新消息后会自动建卡。</div>';
+    } else {
+      wrap.innerHTML = identityCards.map((c, i) => `
+        <div class="card identity-card" data-index="${i}">
+          <label><input class="identity-check" type="checkbox"> 选择</label>
+          <b style="margin-left:8px">QQ ${escapeHtml(c.qq_id)}</b>
+          ${c.linked_qq_ids.length ? `<span class="ep-meta">（合并了 ${escapeHtml(c.linked_qq_ids.join('、'))}）</span>` : ''}
+          <div class="toolbar" style="margin-top:8px">
+            <label>正式名字 <input class="identity-name" value="${escapeHtml(c.canonical_name)}" maxlength="100"></label>
+            <label>代词 <select class="identity-pronoun">
+              ${['TA','她','他'].map(v => `<option value="${v}" ${c.pronoun === v ? 'selected' : ''}>${v}</option>`).join('')}
+            </select></label>
+            <label>类型 <select class="identity-type">
+              <option value="human" ${c.person_type === 'human' ? 'selected' : ''}>人类</option>
+              <option value="AI" ${c.person_type === 'AI' ? 'selected' : ''}>AI</option>
+            </select></label>
+          </div>
+          <label>别名（每行一个，可编辑）<br><textarea class="identity-aliases" rows="2" style="width:100%">${escapeHtml(c.aliases.join('\n'))}</textarea></label>
+        </div>`).join('');
+    }
+    const options = '<option value="">请选择 QQ</option>' + identityCards.map(c =>
+      `<option value="${escapeHtml(c.qq_id)}">${escapeHtml(c.canonical_name)} (${escapeHtml(c.qq_id)})</option>`
+    ).join('');
+    document.getElementById('mergeSource').innerHTML = options;
+    document.getElementById('mergeTarget').innerHTML = options;
+  } catch (e) {
+    wrap.innerHTML = `<div class="error">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function readIdentityCards(onlyChecked = false) {
+  return [...document.querySelectorAll('.identity-card')]
+    .filter(el => !onlyChecked || el.querySelector('.identity-check').checked)
+    .map(el => ({
+      qq_id: identityCards[Number(el.dataset.index)].qq_id,
+      canonical_name: el.querySelector('.identity-name').value.trim(),
+      pronoun: el.querySelector('.identity-pronoun').value,
+      person_type: el.querySelector('.identity-type').value,
+      aliases: el.querySelector('.identity-aliases').value.split(/\r?\n/).map(s => s.trim()).filter(Boolean),
+    }));
+}
+
+async function saveIdentities(onlyChecked = false) {
+  const result = document.getElementById('identityResult');
+  const identities = readIdentityCards(onlyChecked);
+  if (!identities.length) { result.textContent = '请先选择人物'; return; }
+  try {
+    await apiPost('identities/batch', {identities});
+    result.textContent = `已保存 ${identities.length} 张身份卡`;
+    await loadIdentities();
+  } catch (e) { result.textContent = `保存失败：${e.message}`; }
+}
+
+async function applyIdentityBatch() {
+  const pronoun = document.getElementById('batchPronoun').value;
+  const type = document.getElementById('batchType').value;
+  for (const el of document.querySelectorAll('.identity-card')) {
+    if (!el.querySelector('.identity-check').checked) continue;
+    if (pronoun) el.querySelector('.identity-pronoun').value = pronoun;
+    if (type) el.querySelector('.identity-type').value = type;
+  }
+  await saveIdentities(true);
+}
+
+async function mergeIdentities() {
+  const source_qq_id = document.getElementById('mergeSource').value;
+  const target_qq_id = document.getElementById('mergeTarget').value;
+  const result = document.getElementById('identityResult');
+  if (!source_qq_id || !target_qq_id || source_qq_id === target_qq_id) {
+    result.textContent = '请选择不同的来源与目标 QQ'; return;
+  }
+  if (!confirm(`确认将 QQ ${source_qq_id} 合并到 QQ ${target_qq_id}？`)) return;
+  try {
+    await apiPost('identities/merge', {source_qq_id, target_qq_id});
+    result.textContent = '已合并身份';
+    await loadIdentities();
+  } catch (e) { result.textContent = `合并失败：${e.message}`; }
+}
 
 // ============ Stats ============
 async function loadStats() {
@@ -331,7 +435,7 @@ async function loadEpisodes() {
     }
     wrap.innerHTML = eps.map(ep => {
       const dt = new Date(ep.event_start_at * 1000).toLocaleString();
-      const parts = (ep.participants || []).map(p => p.speaker_name).join('、') || '-';
+      const parts = (ep.participants || []).map(p => p.canonical_name || p.speaker_name).join('、') || '-';
       const tag = ep.chat_type === 'group' ? 'tag-group' : 'tag-private';
       const tagLabel = ep.chat_type === 'group' ? '群聊' : '私聊';
       return `<div class="card" onclick="loadDetail(${ep.id})" style="cursor:pointer">
@@ -358,7 +462,7 @@ async function loadDetail(id) {
     const tag = ep.chat_type === 'group' ? 'tag-group' : 'tag-private';
     const tagLabel = ep.chat_type === 'group' ? '群聊' : '私聊';
     const parts = (ep.participants || []).map(p =>
-      `<span class="tag">${escapeHtml(p.speaker_name)}${p.role==='assistant' ? ' (Astra)' : ''}</span>`
+      `<span class="tag">${escapeHtml(p.canonical_name || p.speaker_name)}${p.role==='assistant' ? ' (Astra)' : ''}</span>`
     ).join('');
     const kw = (ep.keywords || []).map(k => `<span class="tag">${escapeHtml(k)}</span>`).join('');
 
@@ -367,7 +471,7 @@ async function loadDetail(id) {
       evidenceHtml = ep.raw_evidence.map(r => {
         const t = new Date(r.created_at * 1000).toLocaleTimeString();
         const cls = r.role === 'assistant' ? 'raw-msg assistant' : 'raw-msg';
-        return `<div class="${cls}"><span style="color:var(--muted)">${t}</span> <b>${escapeHtml(r.speaker_name)}</b>: ${escapeHtml(r.content)}</div>`;
+        return `<div class="${cls}"><span style="color:var(--muted)">${t}</span> <b>${escapeHtml(r.canonical_name || r.speaker_name)}</b>: ${escapeHtml(r.content)}</div>`;
       }).join('');
     } else {
       evidenceHtml = '<div class="empty">原始消息已按保留策略清理</div>';
@@ -437,7 +541,7 @@ async function loadRaw() {
         return `<tr>
           <td>${r.id}</td><td>${t}</td>
           <td>${r.chat_type}</td><td>${r.role}</td>
-          <td>${escapeHtml(r.speaker_name)}</td>
+          <td>${escapeHtml(r.canonical_name || r.speaker_name)}</td>
           <td class="small">${escapeHtml(r.content)}</td>
           <td>${r.trigger_raw_id || '-'}</td>
           <td>${badge}</td>

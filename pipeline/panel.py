@@ -72,6 +72,43 @@ class MemoirPanel:
         import asyncio
         self._repair_lock = asyncio.Lock()
 
+    # ---------- identities ----------
+
+    async def list_identities(self) -> dict:
+        try:
+            cards = await self.db.run(self.db.identities.list_all)
+            return {"status": "ok", "data": cards}
+        except Exception as e:
+            logger.exception("[Memoir] list_identities failed")
+            return {"status": "error", "message": str(e)}
+
+    async def save_identities(self) -> dict:
+        body = await _json_body()
+        try:
+            cards = await self.db.run(
+                self.db.identities.update_many, body.get("identities")
+            )
+            return {"status": "ok", "data": cards}
+        except (ValueError, TypeError) as e:
+            return {"status": "error", "message": str(e)}
+        except Exception as e:
+            logger.exception("[Memoir] save_identities failed")
+            return {"status": "error", "message": str(e)}
+
+    async def merge_identities(self) -> dict:
+        body = await _json_body()
+        try:
+            card = await self.db.run(
+                self.db.identities.merge,
+                body.get("source_qq_id"), body.get("target_qq_id"),
+            )
+            return {"status": "ok", "data": card}
+        except (ValueError, TypeError) as e:
+            return {"status": "error", "message": str(e)}
+        except Exception as e:
+            logger.exception("[Memoir] merge_identities failed")
+            return {"status": "error", "message": str(e)}
+
     # ---------- stats ----------
 
     async def get_stats(self) -> dict:
@@ -245,7 +282,10 @@ class MemoirPanel:
                     "WHERE episode_id = ?",
                     (e["id"],),
                 )
-                ep_dict["participants"] = [_row_to_dict(p) for p in parts]
+                ep_dict["participants"] = [
+                    {**_row_to_dict(p), "canonical_name": self.db.identities.display(
+                        p["speaker_id"], p["speaker_name"])[0]} for p in parts
+                ]
                 result.append(ep_dict)
             return result
 
@@ -275,7 +315,10 @@ class MemoirPanel:
                 "WHERE episode_id = ?",
                 (eid,),
             )
-            ep_dict["participants"] = [_row_to_dict(p) for p in parts]
+            ep_dict["participants"] = [
+                {**_row_to_dict(p), "canonical_name": self.db.identities.display(
+                    p["speaker_id"], p["speaker_name"])[0]} for p in parts
+            ]
 
             keywords = self.db.fetchall(
                 "SELECT keyword FROM episode_keywords WHERE episode_id = ?",
@@ -297,7 +340,10 @@ class MemoirPanel:
                     f"ORDER BY created_at ASC",
                     source_ids,
                 )
-                ep_dict["raw_evidence"] = [_row_to_dict(r) for r in raws]
+                ep_dict["raw_evidence"] = [
+                    {**_row_to_dict(r), "canonical_name": self.db.identities.display(
+                        r["speaker_id"], r["speaker_name"])[0]} for r in raws
+                ]
                 found_ids = {r["id"] for r in raws}
                 ep_dict["raw_missing_ids"] = [
                     i for i in source_ids if i not in found_ids
@@ -361,7 +407,10 @@ class MemoirPanel:
             sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
             params.extend([limit, offset])
             rows = self.db.fetchall(sql, tuple(params))
-            return [_row_to_dict(r) for r in rows]
+            return [
+                {**_row_to_dict(r), "canonical_name": self.db.identities.display(
+                    r["speaker_id"], r["speaker_name"])[0]} for r in rows
+            ]
 
         try:
             return {"status": "ok", "data": await self.db.run(_q)}
@@ -467,6 +516,15 @@ def register_panel_routes(context, panel: MemoirPanel):
     async def h_repair_vectors():
         return await panel.repair_vectors()
 
+    async def h_list_identities():
+        return await panel.list_identities()
+
+    async def h_save_identities():
+        return await panel.save_identities()
+
+    async def h_merge_identities():
+        return await panel.merge_identities()
+
     context.register_web_api(
         f"{_ROUTE_PREFIX}/stats", h_stats, methods=["GET"],
         desc="Memoir status: episode 总数、今日、未处理 raw 等",
@@ -493,4 +551,17 @@ def register_panel_routes(context, panel: MemoirPanel):
         desc="Memoir repair missing vectors",
     )
 
-    logger.info("[Memoir] panel API endpoints registered (6 routes)")
+    context.register_web_api(
+        f"{_ROUTE_PREFIX}/identities", h_list_identities, methods=["GET"],
+        desc="Memoir QQ identity cards",
+    )
+    context.register_web_api(
+        f"{_ROUTE_PREFIX}/identities/batch", h_save_identities, methods=["POST"],
+        desc="Memoir edit identity cards",
+    )
+    context.register_web_api(
+        f"{_ROUTE_PREFIX}/identities/merge", h_merge_identities, methods=["POST"],
+        desc="Memoir merge two QQ identities",
+    )
+
+    logger.info("[Memoir] panel API endpoints registered (9 routes)")

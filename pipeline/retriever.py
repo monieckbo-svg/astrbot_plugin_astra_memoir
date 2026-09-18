@@ -231,7 +231,13 @@ class Retriever:
             )
             by_id: dict[int, list] = {}
             for part in parts:
-                by_id.setdefault(part["episode_id"], []).append(part)
+                by_id.setdefault(part["episode_id"], []).append({
+                    **dict(part),
+                    "speaker_id": self.db.identities.resolve(part["speaker_id"]),
+                    "speaker_name": self.db.identities.display(
+                        part["speaker_id"], part["speaker_name"]
+                    )[0],
+                })
             return rows, by_id
         rows, parts_by_id = await self.db.run(_load)
         now = int(time.time())
@@ -279,6 +285,11 @@ class Retriever:
         """
         if not query or not query.strip():
             return []
+
+        if str(current_speaker_id or "").strip():
+            current_speaker_id = await self.db.run(
+                self.db.identities.resolve, current_speaker_id
+            )
 
         vis = self._visibility_kwargs(chat_type, session_id, group_id, current_speaker_id)
         if vis is None:
@@ -399,7 +410,9 @@ class Retriever:
             )
             m: dict[int, list[tuple[str, str, str]]] = {}
             for r in rows:
-                m.setdefault(r["episode_id"], []).append((r["speaker_id"], r["speaker_name"], r["role"]))
+                name = self.db.identities.display(r["speaker_id"], r["speaker_name"])[0]
+                qq = self.db.identities.resolve(r["speaker_id"])
+                m.setdefault(r["episode_id"], []).append((qq, name, r["role"]))
             return m
 
         parts_map = await self.db.run(_load_parts)

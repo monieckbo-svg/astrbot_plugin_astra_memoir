@@ -82,6 +82,8 @@ class RawCache:
             key = user_dedupe_key(session_id, platform_message_id)
 
             def _insert():
+                # 即使 Astra 尚未产生可缓存的回复，也先建自己的身份卡。
+                self.db.identities.observe(event.get_self_id(), self.bot_display_name, "assistant")
                 return self.db.insert_raw_message(
                     dedupe_key=key,
                     platform=self._platform_of(event),

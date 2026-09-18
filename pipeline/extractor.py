@@ -84,6 +84,7 @@ _SYSTEM_PROMPT_PRIVATE = """你是记忆系统的事件提取器，只输出严�
 - assistant（星星）在事件中：用"我"指代星星本人（例：我提议、我告诉陆忱……）
 - 用户在事件中：严格点名（例：陆忱说……）
 - 星星未参与的事件：客观记录，不硬写"我看到"
+- 人物以 [qq] / [person] 为准，[name] 只是当时昵称。优先用正式名字；代词仅用已设置的 [pronoun]，TA 不猜性别。
 
 输出格式（严格 JSON，不带 markdown fence 或额外说明）：
 {"events":[
@@ -102,7 +103,7 @@ _SYSTEM_PROMPT_GROUP = """你是记忆系统的事件提取器，只输出严格
 规则：
 1. 一批可以包含 0 到 N 个事件。不同主题必须拆开。
 2. 群聊中即使 AI 助手完全没有参与，只要有值得记忆的信息（个人经历、观点、决定、事件），也应提取。
-3. 每条消息前的 [qq=XXX][name=YYY][role=Z] 表明发言者身份，不同人的言论必须严格区分。绝不允许把 A 说的话记成 B 说的。
+3. 每条消息前的 [qq=XXX][person=正式名字][name=当时昵称][role=Z] 表明发言者身份；同一 QQ 是同一个人，不同人的言论必须严格区分。
 4. 每个事件必须能脱离本批次独立理解，保留具体人、物、名称、数字、决定和结果。
 5. 不要生成"群里聊了各种话题"这种空泛摘要。
 6. 单纯的"哈哈哈"、表情、寒暄没有值得记忆的内容时，返回 events=[]。
@@ -113,8 +114,9 @@ _SYSTEM_PROMPT_GROUP = """你是记忆系统的事件提取器，只输出严格
 
 【第一人称记事】
 - role=assistant（星星）参与的事件：用"我"指代星星本人
-- 其他人：严格点名（用 [name] 标签里的昵称）
+- 其他人：严格点名（优先用 [person] 正式名字；[name] 只是当时昵称）
 - 星星完全没参与的事件：客观第三人称记录（例："小雨在群里说自己感冒了"），不硬写"我看到"
+- 仅按 [pronoun] 使用 TA/她/他，不根据昵称、语气或聊天内容推断性别。
 
 输出格式（严格 JSON，不带 markdown fence 或额外说明）：
 {"events":[
@@ -123,7 +125,8 @@ _SYSTEM_PROMPT_GROUP = """你是记忆系统的事件提取器，只输出严格
 如没有值得记忆的事件，返回：{"events":[]}"""
 
 
-def _format_msg_line(row: sqlite3.Row, include_speaker_meta: bool) -> str:
+def _format_msg_line(row: sqlite3.Row, include_speaker_meta: bool,
+                     identity: tuple[str, str] | None = None) -> str:
     """
     格式化一条消息给 LLM 看。
     - 私聊: [raw_id=N][role=user] 陆忱: 内容
@@ -132,35 +135,42 @@ def _format_msg_line(row: sqlite3.Row, include_speaker_meta: bool) -> str:
     rid = row["id"]
     role = row["role"]
     content = row["content"].replace("\n", " ")  # 单行化，避免 prompt 结构混乱
+    person, pronoun = identity or (row["speaker_name"], "TA")
     if include_speaker_meta:
-        return f"[raw_id={rid}][qq={row['speaker_id']}][name={row['speaker_name']}][role={role}] {content}"
+        return (f"[raw_id={rid}][qq={row['speaker_id']}][person={person}]"
+                f"[pronoun={pronoun}][name={row['speaker_name']}][role={role}] {content}")
     else:
-        return f"[raw_id={rid}][role={role}] {row['speaker_name']}: {content}"
+        return (f"[raw_id={rid}][qq={row['speaker_id']}][person={person}]"
+                f"[pronoun={pronoun}][role={role}] {person}: {content}")
 
 
 def build_user_prompt(
     new_msgs: list[sqlite3.Row],
     overlap_msgs: list[sqlite3.Row],
     chat_type: str,
+    identities: dict[str, tuple[str, str]] | None = None,
 ) -> str:
     """
     组装 user prompt。overlap 放 <context_only>，新消息放 <new_messages>。
     """
     is_group = chat_type == "group"
+    identities = identities or {}
     lines: list[str] = []
 
     if overlap_msgs:
         lines.append("<context_only>")
         lines.append("(以下是上一批对话的尾部，仅帮助你理解上下文，不允许单独据此提取事件)")
         for row in overlap_msgs:
-            lines.append(_format_msg_line(row, include_speaker_meta=is_group))
+            lines.append(_format_msg_line(row, include_speaker_meta=is_group,
+                                          identity=identities.get(str(row["speaker_id"]))))
         lines.append("</context_only>")
         lines.append("")
 
     lines.append("<new_messages>")
     lines.append("(以下是本批新增消息，事件的 source_raw_ids 必须至少含其中一个 raw_id)")
     for row in new_msgs:
-        lines.append(_format_msg_line(row, include_speaker_meta=is_group))
+        lines.append(_format_msg_line(row, include_speaker_meta=is_group,
+                                      identity=identities.get(str(row["speaker_id"]))))
     lines.append("</new_messages>")
 
     return "\n".join(lines)
@@ -373,7 +383,11 @@ class EventExtractor:
             return ExtractResult(success=False, error=error)
 
         system_prompt = _SYSTEM_PROMPT_GROUP if chat_type == "group" else _SYSTEM_PROMPT_PRIVATE
-        user_prompt = build_user_prompt(new_msgs, overlap_msgs, chat_type)
+        def _identity_map():
+            ids = {str(m["speaker_id"]) for m in [*new_msgs, *overlap_msgs]}
+            return {qq: self.db.identities.display(qq) for qq in ids}
+        identities = await self.db.run(_identity_map)
+        user_prompt = build_user_prompt(new_msgs, overlap_msgs, chat_type, identities)
         new_msg_ids = {int(m["id"]) for m in new_msgs}
         overlap_msg_ids = {int(m["id"]) for m in overlap_msgs}
 

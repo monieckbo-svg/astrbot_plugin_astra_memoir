@@ -32,6 +32,8 @@ const bridge = {
       embedding_dim: 8, embedding_status: 'ok', active_sessions: [],
     };
     if (route === 'episodes') return [episode];
+    if (route === 'identities') return [{qq_id: '111', canonical_name: '陆忱',
+      pronoun: 'TA', person_type: 'human', aliases: ['喵日天'], linked_qq_ids: []}];
     if (route === 'episodes/7') return episode;
     if (route === 'raw') return [{id: 1, created_at: 1, chat_type: 'private',
       role: 'user', speaker_name: '甲', content: '原文'}];
@@ -60,6 +62,8 @@ vm.runInNewContext(script, sandbox);
   assert.match(element('statsGrid').innerHTML, /Episode 总数/);
   await sandbox.loadEpisodes();
   assert.match(element('episodesList').innerHTML, /真实记忆/);
+  await sandbox.loadIdentities();
+  assert.match(element('identityList').innerHTML, /喵日天/);
   await sandbox.loadDetail(7);
   assert.match(element('detailContent').innerHTML, /今天修好了插件/);
   await sandbox.loadRaw();
@@ -71,6 +75,6 @@ vm.runInNewContext(script, sandbox);
   assert.match(element('dbgResults').innerHTML, /resolved_owner_id: 111/);
   await sandbox.repairVectors();
   assert.match(element('repairResult').textContent, /补齐 0 条/);
-  assert.deepEqual(calls.slice(0, 5), ['stats', 'stats', 'episodes', 'episodes/7', 'raw']);
+  assert.deepEqual(calls.slice(0, 6), ['stats', 'stats', 'episodes', 'identities', 'episodes/7', 'raw']);
   console.log('Panel bridge unwrapped data test passed');
 })().catch(err => { console.error(err); process.exitCode = 1; });

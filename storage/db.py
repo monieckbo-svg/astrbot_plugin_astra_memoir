@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import sqlite_vec
+from .identity import IdentityStore
 
 # schema.sql 相对于本文件的位置
 _SCHEMA_SQL_PATH = Path(__file__).parent / "schema.sql"
@@ -39,6 +40,7 @@ class MemoirDB:
         self.embedding_provider_id = embedding_provider_id
         self._conn: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()  # 用于并发写入的粗粒度保护
+        self.identities = IdentityStore(self)
 
     # ---------- 初始化 ----------
 
@@ -125,6 +127,9 @@ class MemoirDB:
         )
 
         self._conn = conn
+        if self.get_meta("identity_backfill_done") != "1":
+            self.identities.backfill()
+            self.set_meta("identity_backfill_done", "1")
 
     def close(self) -> None:
         if self._conn is not None:
@@ -220,7 +225,10 @@ class MemoirDB:
                 content, reply_to_id, trigger_raw_id, created_at,
             ),
         )
-        return cur.lastrowid if cur.rowcount > 0 else None
+        if cur.rowcount > 0:
+            self.identities.observe(speaker_id, speaker_name, role)
+            return cur.lastrowid
+        return None
 
     def find_raw_by_platform_msg(
         self, session_id: str, platform_message_id: str,

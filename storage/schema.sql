@@ -83,6 +83,23 @@ CREATE TABLE IF NOT EXISTS episode_participants (
 CREATE INDEX IF NOT EXISTS idx_ep_part_speaker
     ON episode_participants(speaker_id);
 
+-- 人物身份：QQ 号为观测主键；合并只建立映射，不改写历史 raw。
+CREATE TABLE IF NOT EXISTS identities (
+    qq_id           TEXT PRIMARY KEY,
+    canonical_name  TEXT NOT NULL,
+    pronoun         TEXT NOT NULL DEFAULT 'TA' CHECK(pronoun IN ('TA','她','他')),
+    person_type     TEXT NOT NULL DEFAULT 'human' CHECK(person_type IN ('human','AI'))
+);
+CREATE TABLE IF NOT EXISTS identity_aliases (
+    qq_id TEXT NOT NULL REFERENCES identities(qq_id) ON DELETE CASCADE,
+    alias TEXT NOT NULL,
+    PRIMARY KEY (qq_id, alias)
+);
+CREATE TABLE IF NOT EXISTS identity_redirects (
+    source_qq_id TEXT PRIMARY KEY,
+    target_qq_id TEXT NOT NULL REFERENCES identities(qq_id)
+);
+
 -- ============================================================
 -- 4. episode_keywords: 关键词
 -- ============================================================
