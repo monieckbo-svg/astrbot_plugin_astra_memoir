@@ -13,9 +13,11 @@ class Provider:
         items = json.loads(prompt.split("<episodes>\n",1)[1].split("\n</episodes>",1)[0])
         ids = [x["id"] for x in items]
         if len(ids) >= 3:
+            first_person = any(x.get("astra_participated") for x in items[:2])
             decisions = [
                 {"action":"merge","ids":ids[:2],"title":"持续插件开发",
-                 "content":"我和陆忱持续完善了插件。","importance":4,"reason":"同一持续事件"},
+                 "content":("我和陆忱持续完善了插件。" if first_person else
+                            "陆忱持续完善了插件。"),"importance":4,"reason":"同一持续事件"},
                 *[{"action":"archive","ids":[i],"importance":1,"reason":"一次性闲聊"} for i in ids[2:]],
             ]
         else:
@@ -38,6 +40,7 @@ async def main():
                 title=title,content=content,source_raw_ids=[],event_start_at=now+i,
                 event_end_at=now+i,extracted_at=now,importance=3)
             db.insert_fts(eid,title,content,[])
+            db.insert_participants(eid,[{"speaker_id":"111","speaker_name":"陆忱","role":"user"}])
             vec.upsert(eid,await emb.get_embedding(title+content),chat_type="private",session_id="s",group_id=None)
             ids.append(eid)
         manager=MaintenanceManager(db,vec,writer,Extractor(),batch_size=12)
@@ -54,6 +57,7 @@ async def main():
         assert applied["status"]=="applied"
         merged=db.fetchone("SELECT * FROM episodes WHERE created_by_run_id=?",(preview["id"],))
         assert merged and merged["status"]=="active"
+        assert "我" not in merged["content"]
         assert len(db.fetchall("SELECT * FROM episode_merge_sources WHERE merged_episode_id=?",(merged["id"],)))==2
         assert all(db.fetchone("SELECT status FROM episodes WHERE id=?",(i,))[0]=="archived" for i in ids)
         await manager.undo(preview["id"])

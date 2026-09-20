@@ -171,6 +171,7 @@ CREATE TABLE IF NOT EXISTS maintenance_runs (
     merge_result_count INTEGER NOT NULL DEFAULT 0,
     batch_count INTEGER NOT NULL DEFAULT 0,
     completed_batches INTEGER NOT NULL DEFAULT 0,
+    logic_version INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL,
     applied_at INTEGER,
     undone_at INTEGER,

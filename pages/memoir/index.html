@@ -717,7 +717,8 @@ async function loadMaintenanceRuns() {
       ${r.status === 'generating' ? `<div class="ep-meta">模型整理进度：${r.completed_batches || 0} / ${r.batch_count || '?'} 批</div>` : ''}
       <div class="ep-meta">备份：${escapeHtml(r.backup_path || '-')}</div>
       <div class="toolbar"><button onclick="showMaintenanceRun(${r.id})">查看方案</button>
-      ${r.status === 'preview' ? `<button onclick="applyMaintenance(${r.id})">应用整理结果</button>` : ''}
+      ${r.status === 'preview' && (r.logic_version || 1) >= 2 ? `<button onclick="applyMaintenance(${r.id})">应用整理结果</button>` : ''}
+      ${r.status === 'preview' && (r.logic_version || 1) < 2 ? `<span class="error">旧版人称规则方案，已禁用；请重新生成 Preview</span>` : ''}
       ${r.status === 'applied' ? `<button onclick="undoMaintenance(${r.id})">撤销本次整理</button>` : ''}</div>
       <div id="run-${r.id}"></div></div>`).join('');
   } catch (e) { wrap.innerHTML = `<div class="error">${escapeHtml(e.message)}</div>`; }

@@ -12,12 +12,15 @@ from pathlib import Path
 
 from astrbot.api import logger
 
+MAINTENANCE_LOGIC_VERSION = 2
+
 
 MAINTENANCE_PROMPT = """你是 Astra Memoir 的记忆整理器。你不是写日报，而是在同一小批独立 episode 中判断长期价值。
 只能输出严格 JSON，只允许 keep / archive / merge，绝不 delete。
 判断重点：几天到几周后重新提起，对 Astra 是否仍有价值？
 普通画图请求、表情包、一次性玩笑、重复闲聊、无后续小事优先 archive；明确决定、人物状态变化、项目进展、新设定、持续话题和有后续影响的互动保留。
-同一持续事件的碎片可以 merge；不同主题绝不能因为同一天而合并。merge 必须写成一条自然、完整、忠实的第一人称记忆，不添加原文没有的事实。
+同一持续事件的碎片可以 merge；不同主题绝不能因为同一天而合并。merge 必须写成一条自然、完整、忠实的事件记忆，不添加原文没有的事实。
+人称规则是硬规则：只有输入中 astra_participated=true，且事实确实是 role=assistant 的 Astra 所做或所说，才能用“我”指代 Astra；群友或其他 AI 的言行必须使用 participants 中的正式名字。若 astra_participated=false，标题和正文都禁止使用“我/我们”，必须客观第三人称记录，也不要虚构“我看到/我得知”。
 每个输入 id 必须且只能出现一次。keep/archive 的 ids 必须只有一个；merge 至少两个。
 edited_by_user=true 的正文是用户手工事实，绝不能 merge 或改写；过保护期后只能 keep 或 archive。
 importance 为 1~5 的重新评估结果。
@@ -85,6 +88,10 @@ class MaintenanceManager:
         payload = [{"id": r["id"], "title": r["title"], "content": r["content"],
                     "importance": r["importance"], "source": r["chat_type"],
                     "edited_by_user": bool(r.get("edited_by_user")),
+                    "participants": r.get("participants", []),
+                    "astra_participated": any(
+                        p.get("role") == "assistant" for p in r.get("participants", [])
+                    ),
                     "time": datetime.fromtimestamp(r["event_start_at"]).isoformat()}
                    for r in rows]
         expected = {r["id"] for r in rows}
@@ -121,6 +128,15 @@ class MaintenanceManager:
                         raise ValueError
                     if action == "merge" and any(r["id"] in ids and r.get("edited_by_user") for r in rows):
                         raise ValueError
+                    if action == "merge":
+                        astra_participated = any(
+                            r["id"] in ids and any(
+                                p.get("role") == "assistant" for p in r.get("participants", [])
+                            ) for r in rows
+                        )
+                        merged_text = f"{d.get('title', '')}\n{d.get('content', '')}"
+                        if not astra_participated and "我" in merged_text:
+                            raise ValueError
                     if type(importance) is not int or not 1 <= importance <= 5:
                         raise ValueError
                     seen.update(ids)
@@ -146,8 +162,9 @@ class MaintenanceManager:
         now = int(time.time())
         def _create():
             cur = self.db.execute(
-                "INSERT INTO maintenance_runs(run_type,target_start,target_end,status,backup_path,created_at) "
-                "VALUES(?,?,?,?,?,?)", (run_type, start_ts, end_ts, "generating", backup_path, now))
+                "INSERT INTO maintenance_runs(run_type,target_start,target_end,status,backup_path,created_at,logic_version) "
+                "VALUES(?,?,?,?,?,?,?)", (run_type, start_ts, end_ts, "generating", backup_path,
+                                          now, MAINTENANCE_LOGIC_VERSION))
             if target_date:
                 self.db.execute(
                     "INSERT OR REPLACE INTO maintenance_days(target_date,run_id,status,updated_at) VALUES(?,?,?,?)",
@@ -162,7 +179,21 @@ class MaintenanceManager:
                     "WHERE e.status='active' AND e.event_start_at>=? AND e.event_start_at<? "
                     "AND (e.protected_until IS NULL OR e.protected_until<=?) "
                     "GROUP BY e.id ORDER BY e.event_start_at,e.id", (start_ts, end_ts, now))
-                return [dict(r) for r in rows]
+                result = [dict(r) for r in rows]
+                if not result:
+                    return result
+                ids = [r["id"] for r in result]
+                parts = self.db.fetchall(
+                    f"SELECT episode_id,speaker_id,speaker_name,role FROM episode_participants "
+                    f"WHERE episode_id IN ({','.join('?' * len(ids))})", ids)
+                by_id: dict[int, list[dict]] = defaultdict(list)
+                for p in parts:
+                    name = self.db.identities.display(p["speaker_id"], p["speaker_name"])[0]
+                    by_id[p["episode_id"]].append({
+                        "speaker_id": p["speaker_id"], "name": name, "role": p["role"]})
+                for row in result:
+                    row["participants"] = by_id.get(row["id"], [])
+                return result
             rows = await self.db.run(_load)
             batches = self._small_batches(rows)
             await self.db.run(lambda: self.db.execute(
@@ -235,6 +266,8 @@ class MaintenanceManager:
         detail = await self.db.run(self.run_detail, run_id)
         if detail["status"] != "preview":
             raise ValueError("只有 Preview 方案可以应用")
+        if int(detail.get("logic_version") or 1) != MAINTENANCE_LOGIC_VERSION:
+            raise ValueError("该 Preview 使用旧版整理规则，已禁止应用；请重新生成")
         grouped: dict[str, list[dict]] = defaultdict(list)
         for a in detail["actions"]:
             if a["action"] == "merge": grouped[a["merge_group"]].append(a)

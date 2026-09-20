@@ -106,7 +106,7 @@ class MemoirDB:
             "CREATE INDEX IF NOT EXISTS idx_ep_status_time ON episodes(status, event_start_at)"
         )
         run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(maintenance_runs)")}
-        for name in ("batch_count", "completed_batches"):
+        for name in ("batch_count", "completed_batches", "logic_version"):
             if name not in run_columns:
                 conn.execute(
                     f"ALTER TABLE maintenance_runs ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
