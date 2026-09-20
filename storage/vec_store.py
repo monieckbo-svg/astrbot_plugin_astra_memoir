@@ -155,7 +155,7 @@ class VecStore:
         rows = self.db.fetchall(
             "SELECT e.id FROM episodes e "
             "LEFT JOIN episode_vec v ON v.episode_id = e.id "
-            "WHERE v.episode_id IS NULL "
+            "WHERE v.episode_id IS NULL AND e.status != 'trashed' "
             "ORDER BY e.id LIMIT ?",
             (limit,),
         )

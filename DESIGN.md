@@ -430,6 +430,12 @@ req.extra_user_content_parts.append(
 
 原文默认 `retention_days = 30`。episode 不物理删除；importance=1 不写 episode，importance=2 超过 30 天无强化归档，其他 importance 按检索时效衰减。首次迁移尚无 importance 列的旧 episode 默认 importance=2；已有该列的数据库不批量改写既有评分。
 
+## 可逆维护层
+
+episode 生命周期为 `active / archived / trashed`，`is_archived` 仅作为 sqlite-vec metadata 的兼容镜像。自动历史整理与 nightly maintenance 共用 `MaintenanceManager`：先在线备份数据库，按本地日期、原始来源和主题相似度拆成有上限的小批，模型只返回 `keep / archive / merge`。历史整理停在 Preview，必须由用户应用；nightly 只处理启用后已经结束的日期并自动应用。两者都写入 `maintenance_runs` 与 `maintenance_actions`，不执行永久删除。
+
+merge 创建新 episode，并以 `episode_merge_sources` 保存来源关系；旧 episode 归档并写 `merged_into`。撤销 run 恢复 action 快照中的状态、原因、importance 和合并关系，run 创建的新 episode 进入回收站。用户编辑使用 `episode_versions` 保存正文版本，不修改 source raw、participants 或来源 metadata；手动编辑、恢复后设置 30 天保护期。
+
 ---
 
 ## 8. 重复检测（V1 简化）

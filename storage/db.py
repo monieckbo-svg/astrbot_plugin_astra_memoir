@@ -82,9 +82,18 @@ class MemoirDB:
             ("last_reinforced_at", "TEXT"),
             ("reinforcement_count", "INTEGER NOT NULL DEFAULT 0"),
             ("is_archived", "INTEGER NOT NULL DEFAULT 0"),
+            ("status", "TEXT NOT NULL DEFAULT 'active'"),
+            ("archive_reason", "TEXT"),
+            ("merged_into", "INTEGER"),
+            ("edited_by_user", "INTEGER NOT NULL DEFAULT 0"),
+            ("restored_by_user", "INTEGER NOT NULL DEFAULT 0"),
+            ("protected_until", "INTEGER"),
+            ("created_by_run_id", "INTEGER"),
         ):
             if name not in episode_columns:
                 conn.execute(f"ALTER TABLE episodes ADD COLUMN {name} {definition}")
+        # 老版本只有 is_archived；首次升级时映射到新状态。
+        conn.execute("UPDATE episodes SET status='archived' WHERE is_archived=1 AND status='active'")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ep_active_time "
             "ON episodes(is_archived, event_start_at DESC)"
@@ -92,6 +101,9 @@ class MemoirDB:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ep_active_chat_time "
             "ON episodes(is_archived, chat_type, event_start_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ep_status_time ON episodes(status, event_start_at)"
         )
 
         previous = dict(conn.execute("SELECT key, value FROM meta WHERE key IN ('embedding_dim', 'embedding_provider_id')").fetchall())
@@ -127,6 +139,14 @@ class MemoirDB:
         )
 
         self._conn = conn
+        conn.execute(
+            "UPDATE maintenance_runs SET status='failed', error=COALESCE(error,'插件重启时任务尚未完成') "
+            "WHERE status='generating'"
+        )
+        conn.execute(
+            "UPDATE maintenance_days SET status='failed', updated_at=strftime('%s','now') "
+            "WHERE status='running'"
+        )
         if self.get_meta("identity_backfill_done") != "1":
             self.identities.backfill()
             self.set_meta("identity_backfill_done", "1")
@@ -458,15 +478,16 @@ class MemoirDB:
         cutoff = now_ts - 30 * 86400
         with self.transaction():
             rows = self.fetchall(
-                "SELECT id FROM episodes WHERE importance = 2 AND is_archived = 0 "
+                "SELECT id FROM episodes WHERE importance = 2 AND status='active' "
+                "AND (protected_until IS NULL OR protected_until <= ?) "
                 "AND COALESCE(CAST(strftime('%s', last_reinforced_at) AS INTEGER), event_end_at) < ?",
-                (cutoff,),
+                (now_ts, cutoff),
             )
             ids = [row["id"] for row in rows]
             for start in range(0, len(ids), 500):
                 batch = ids[start:start + 500]
                 placeholders = ",".join("?" * len(batch))
-                self.execute(f"UPDATE episodes SET is_archived = 1 WHERE id IN ({placeholders})", batch)
+                self.execute(f"UPDATE episodes SET is_archived=1,status='archived',archive_reason='短期记忆自然过期' WHERE id IN ({placeholders})", batch)
                 self.execute(f"UPDATE episode_vec SET is_archived = 1 WHERE episode_id IN ({placeholders})", batch)
             return len(ids)
 

@@ -22,6 +22,7 @@ from .pipeline import (
     SchedulerConfig,
     Retriever,
     RetrieverConfig,
+    MaintenanceManager,
 )
 from .pipeline.embedding import resolve_embedding_provider, embedding_dimension
 from .pipeline.panel import MemoirPanel, register_panel_routes
@@ -34,7 +35,7 @@ PLUGIN_NAME = "astrbot_plugin_astra_memoir"
     PLUGIN_NAME,
     "Astra & Celii",
     "星星的自动记忆库 - 私聊/群聊事件消化",
-    "0.1.0",
+    "0.2.0",
     "https://github.com/monieckbo-svg/astrbot_plugin_astra_memoir",
 )
 class AstraMemoir(Star):
@@ -56,6 +57,8 @@ class AstraMemoir(Star):
             overlap_group_messages=int(self._cfg("overlap_group_messages", 4)),
             overlap_private_messages=int(self._cfg("overlap_private_messages", 2)),
             raw_retention_days=int(self._cfg("raw_retention_days", 30)),
+            nightly_maintenance_enabled=bool(self._cfg("nightly_maintenance_enabled", True)),
+            nightly_maintenance_hour=max(0, min(int(self._cfg("nightly_maintenance_hour", 5)), 23)),
         )
 
         retr_cfg = RetrieverConfig(
@@ -98,10 +101,16 @@ class AstraMemoir(Star):
             self.raw_cache = RawCache(self.db, bot_display_name=bot_display_name)
             self.extractor = EventExtractor(context, self.db, extract_provider_id)
             self.writer = EpisodeWriter(provider, self.db, self.vec)
-            self.scheduler = BatchScheduler(self.db, self.extractor, self.writer, sched_cfg)
+            self.maintenance = MaintenanceManager(
+                self.db, self.vec, self.writer, self.extractor,
+                batch_size=int(self._cfg("maintenance_batch_size", 12)),
+            )
+            self.scheduler = BatchScheduler(
+                self.db, self.extractor, self.writer, sched_cfg, self.maintenance)
             self.retriever = Retriever(provider, self.db, self.vec, retr_cfg)
             self.panel = MemoirPanel(self.db, self.vec, self.retriever, self.scheduler,
-                                     self.writer, provider, embedding_provider_id, dim)
+                                     self.writer, provider, embedding_provider_id, dim,
+                                     self.maintenance)
             register_panel_routes(context, self.panel)
             repaired = await self.writer.reindex_missing_vectors()
             logger.info("[Memoir] startup vector repair: %s", repaired)
@@ -178,6 +187,8 @@ class AstraMemoir(Star):
         """插件卸载：停调度，关 DB。"""
         await self._startup_task
         try:
+            if hasattr(self, "panel"):
+                await self.panel.stop_background()
             if self.scheduler:
                 await self.scheduler.stop()
         except Exception:

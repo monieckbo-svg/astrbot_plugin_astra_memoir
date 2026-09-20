@@ -94,5 +94,20 @@
     "description": "后台调度器多少秒扫一次会话（判断是否 idle flush）",
     "type": "int",
     "default": 60
+  },
+  "nightly_maintenance_enabled": {
+    "description": "启用夜间整理（只处理启用后已结束的日期，不自动扫描历史库）",
+    "type": "bool",
+    "default": true
+  },
+  "nightly_maintenance_hour": {
+    "description": "每日整理开始小时（服务器本地时间，默认凌晨 05:00）",
+    "type": "int",
+    "default": 5
+  },
+  "maintenance_batch_size": {
+    "description": "每个整理小批最多包含多少条同日同来源 episode",
+    "type": "int",
+    "default": 12
   }
 }

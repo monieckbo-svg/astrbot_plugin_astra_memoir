@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+import asyncio
+from datetime import datetime, timedelta
 
 from astrbot.api import logger
 from astrbot.api.web import request as astr_request
@@ -60,6 +62,7 @@ class MemoirPanel:
         embedding_provider,
         embedding_provider_id: str,
         embedding_dim: int,
+        maintenance=None,
     ):
         self.db = db
         self.vec = vec
@@ -69,8 +72,10 @@ class MemoirPanel:
         self.embedding_provider = embedding_provider
         self.embedding_provider_id = embedding_provider_id
         self.embedding_dim = embedding_dim
-        import asyncio
+        self.maintenance = maintenance
         self._repair_lock = asyncio.Lock()
+        self._maintenance_lock = asyncio.Lock()
+        self._maintenance_tasks: set[asyncio.Task] = set()
 
     # ---------- identities ----------
 
@@ -119,7 +124,13 @@ class MemoirPanel:
                 "SELECT COUNT(*) AS n FROM episodes"
             )["n"]
             episodes_archived = self.db.fetchone(
-                "SELECT COUNT(*) AS n FROM episodes WHERE is_archived = 1"
+                "SELECT COUNT(*) AS n FROM episodes WHERE status = 'archived'"
+            )["n"]
+            episodes_active = self.db.fetchone(
+                "SELECT COUNT(*) AS n FROM episodes WHERE status = 'active'"
+            )["n"]
+            episodes_trashed = self.db.fetchone(
+                "SELECT COUNT(*) AS n FROM episodes WHERE status = 'trashed'"
             )["n"]
             episodes_today = self.db.fetchone(
                 "SELECT COUNT(*) AS n FROM episodes WHERE extracted_at >= ?",
@@ -133,7 +144,10 @@ class MemoirPanel:
             )["n"]
             missing_vec = self.db.fetchone(
                 "SELECT COUNT(*) AS n FROM episodes e LEFT JOIN episode_vec v "
-                "ON v.episode_id = e.id WHERE v.episode_id IS NULL"
+                "ON v.episode_id = e.id WHERE v.episode_id IS NULL AND e.status != 'trashed'"
+            )["n"]
+            vector_eligible = self.db.fetchone(
+                "SELECT COUNT(*) AS n FROM episodes WHERE status != 'trashed'"
             )["n"]
             last_extracted = self.db.fetchone(
                 "SELECT MAX(extracted_at) AS t FROM episodes"
@@ -146,11 +160,13 @@ class MemoirPanel:
             return {
                 "episodes_total": episodes_total,
                 "episodes_archived": episodes_archived,
+                "episodes_active": episodes_active,
+                "episodes_trashed": episodes_trashed,
                 "episodes_today": episodes_today,
                 "raw_total": raw_total,
                 "raw_unprocessed": raw_unproc,
                 "vec_missing": missing_vec,
-                "vec_covered": episodes_total - missing_vec,
+                "vec_covered": vector_eligible - missing_vec,
                 "embedding_provider_id": self.embedding_provider_id,
                 "embedding_provider_name": provider_display_name(
                     self.embedding_provider, self.embedding_provider_id
@@ -185,6 +201,7 @@ class MemoirPanel:
         session_id = _query("session_id")
         group_id = _query("group_id")
         archived = _query("archived")
+        status = _query("status")
         search = _query("q")
         try:
             limit = min(int(_query("limit", 50)), 200)
@@ -211,6 +228,9 @@ class MemoirPanel:
             if archived in ("0", "1"):
                 conditions.append("is_archived = ?")
                 params.append(int(archived))
+            if status in ("active", "archived", "trashed"):
+                conditions.append("status = ?")
+                params.append(status)
 
             if search:
                 sql = (
@@ -356,6 +376,11 @@ class MemoirPanel:
                 "SELECT episode_id FROM episode_vec WHERE episode_id = ?", (eid,)
             )
             ep_dict["vec_present"] = vec_row is not None
+            ep_dict["versions"] = [_row_to_dict(v) for v in self.db.fetchall(
+                "SELECT * FROM episode_versions WHERE episode_id=? ORDER BY id DESC", (eid,))]
+            ep_dict["merged_from"] = [_row_to_dict(v) for v in self.db.fetchall(
+                "SELECT e.* FROM episode_merge_sources m JOIN episodes e ON e.id=m.source_episode_id "
+                "WHERE m.merged_episode_id=? ORDER BY e.event_start_at,e.id", (eid,))]
 
             return ep_dict
 
@@ -417,6 +442,84 @@ class MemoirPanel:
         except Exception as e:
             logger.exception("[Memoir] list_raw 异常")
             return {"status": "error", "message": str(e), "data": []}
+
+    # ---------- lifecycle / edit / maintenance ----------
+
+    async def episode_edit(self, episode_id: str) -> dict:
+        body = await _json_body()
+        try:
+            data = await self.maintenance.edit_episode(
+                int(episode_id), str(body.get("title", "")), str(body.get("content", "")),
+                int(body.get("importance", 0)))
+            return {"status": "ok", "data": data}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    async def episode_action(self, episode_id: str) -> dict:
+        body = await _json_body()
+        try:
+            action = str(body.get("action", ""))
+            if action == "undo_edit":
+                data = await self.maintenance.undo_latest_edit(int(episode_id))
+                return {"status": "ok", "data": data}
+            if action == "permanent_delete":
+                await self.db.run(self.maintenance.permanent_delete, int(episode_id))
+                return {"status": "ok", "data": {"deleted": True}}
+            data = await self.db.run(self.maintenance.manual_state, int(episode_id), action,
+                                     body.get("reason"))
+            return {"status": "ok", "data": data}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    async def maintenance_preview(self) -> dict:
+        body = await _json_body()
+        try:
+            start = datetime.fromisoformat(str(body.get("start_date"))).date()
+            end = datetime.fromisoformat(str(body.get("end_date"))).date() + timedelta(days=1)
+            if self._maintenance_lock.locked():
+                return {"status": "error", "message": "已有历史整理正在生成 Preview"}
+            await self._maintenance_lock.acquire()
+            start_ts = int(datetime.combine(start, datetime.min.time()).timestamp())
+            end_ts = int(datetime.combine(end, datetime.min.time()).timestamp())
+            async def _background():
+                try:
+                    await self.maintenance.preview(start_ts, end_ts, run_type="history")
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("[Memoir] background maintenance preview failed")
+                finally:
+                    self._maintenance_lock.release()
+            task = asyncio.create_task(_background(), name="memoir-history-preview")
+            self._maintenance_tasks.add(task)
+            task.add_done_callback(self._maintenance_tasks.discard)
+            return {"status": "ok", "data": {"started": True}}
+        except Exception as e:
+            logger.exception("[Memoir] maintenance preview failed")
+            return {"status": "error", "message": str(e)}
+
+    async def stop_background(self):
+        for task in list(self._maintenance_tasks):
+            task.cancel()
+        if self._maintenance_tasks:
+            await asyncio.gather(*self._maintenance_tasks, return_exceptions=True)
+        self._maintenance_tasks.clear()
+
+    async def maintenance_runs(self) -> dict:
+        try: return {"status": "ok", "data": await self.db.run(self.maintenance.list_runs)}
+        except Exception as e: return {"status": "error", "message": str(e)}
+
+    async def maintenance_detail(self, run_id: str) -> dict:
+        try: return {"status": "ok", "data": await self.db.run(self.maintenance.run_detail, int(run_id))}
+        except Exception as e: return {"status": "error", "message": str(e)}
+
+    async def maintenance_apply(self, run_id: str) -> dict:
+        try: return {"status": "ok", "data": await self.maintenance.apply(int(run_id))}
+        except Exception as e: return {"status": "error", "message": str(e)}
+
+    async def maintenance_undo(self, run_id: str) -> dict:
+        try: return {"status": "ok", "data": await self.maintenance.undo(int(run_id))}
+        except Exception as e: return {"status": "error", "message": str(e)}
 
     # ---------- debug recall ----------
 
@@ -525,6 +628,14 @@ def register_panel_routes(context, panel: MemoirPanel):
     async def h_merge_identities():
         return await panel.merge_identities()
 
+    async def h_episode_edit(episode_id: str): return await panel.episode_edit(episode_id)
+    async def h_episode_action(episode_id: str): return await panel.episode_action(episode_id)
+    async def h_maintenance_preview(): return await panel.maintenance_preview()
+    async def h_maintenance_runs(): return await panel.maintenance_runs()
+    async def h_maintenance_detail(run_id: str): return await panel.maintenance_detail(run_id)
+    async def h_maintenance_apply(run_id: str): return await panel.maintenance_apply(run_id)
+    async def h_maintenance_undo(run_id: str): return await panel.maintenance_undo(run_id)
+
     context.register_web_api(
         f"{_ROUTE_PREFIX}/stats", h_stats, methods=["GET"],
         desc="Memoir status: episode 总数、今日、未处理 raw 等",
@@ -564,4 +675,19 @@ def register_panel_routes(context, panel: MemoirPanel):
         desc="Memoir merge two QQ identities",
     )
 
-    logger.info("[Memoir] panel API endpoints registered (9 routes)")
+    context.register_web_api(f"{_ROUTE_PREFIX}/episodes/<episode_id>/edit", h_episode_edit,
+                             methods=["POST"], desc="Edit episode with version history")
+    context.register_web_api(f"{_ROUTE_PREFIX}/episodes/<episode_id>/action", h_episode_action,
+                             methods=["POST"], desc="Archive/restore/trash/permanently delete episode")
+    context.register_web_api(f"{_ROUTE_PREFIX}/maintenance/preview", h_maintenance_preview,
+                             methods=["POST"], desc="Backup and preview historical maintenance")
+    context.register_web_api(f"{_ROUTE_PREFIX}/maintenance/runs", h_maintenance_runs,
+                             methods=["GET"], desc="Maintenance run history")
+    context.register_web_api(f"{_ROUTE_PREFIX}/maintenance/runs/<run_id>", h_maintenance_detail,
+                             methods=["GET"], desc="Maintenance run detail")
+    context.register_web_api(f"{_ROUTE_PREFIX}/maintenance/runs/<run_id>/apply", h_maintenance_apply,
+                             methods=["POST"], desc="Apply preview")
+    context.register_web_api(f"{_ROUTE_PREFIX}/maintenance/runs/<run_id>/undo", h_maintenance_undo,
+                             methods=["POST"], desc="Undo applied maintenance")
+
+    logger.info("[Memoir] panel API endpoints registered (16 routes)")

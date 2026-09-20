@@ -4,6 +4,7 @@ from .extractor import EventExtractor, ExtractedEvent, ExtractResult
 from .writer import EpisodeWriter, WriteBatchError
 from .scheduler import BatchScheduler, SchedulerConfig
 from .retriever import Retriever, RetrieverConfig, RecallResult
+from .maintenance import MaintenanceManager
 
 __all__ = [
     "RawCache",
@@ -17,4 +18,5 @@ __all__ = [
     "Retriever",
     "RetrieverConfig",
     "RecallResult",
+    "MaintenanceManager",
 ]

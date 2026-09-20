@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from astrbot.api import logger
 
@@ -33,6 +34,8 @@ class SchedulerConfig:
     overlap_group_messages: int = 4
     overlap_private_messages: int = 2
     raw_retention_days: int = 30
+    nightly_maintenance_enabled: bool = True
+    nightly_maintenance_hour: int = 5
 
 
 class BatchScheduler:
@@ -42,11 +45,13 @@ class BatchScheduler:
         extractor: EventExtractor,
         writer: EpisodeWriter,
         config: SchedulerConfig,
+        maintenance=None,
     ):
         self.db = db
         self.extractor = extractor
         self.writer = writer
         self.config = config
+        self.maintenance = maintenance
 
         self._main_task: asyncio.Task | None = None
         self._stop_evt = asyncio.Event()
@@ -54,6 +59,7 @@ class BatchScheduler:
         # 追踪所有后台 task，terminate 时收干净
         self._background_tasks: set[asyncio.Task] = set()
         self._last_ttl_at: float = 0.0
+        self._last_nightly_check: float = 0.0
 
     # ---------- 生命周期 ----------
 
@@ -154,6 +160,11 @@ class BatchScheduler:
         if now - self._last_ttl_at > 86400:
             self._last_ttl_at = now
             self._spawn(self._ttl_cleanup(), name="memoir-ttl")
+        if (self.maintenance and self.config.nightly_maintenance_enabled
+                and now - self._last_nightly_check > 3600
+                and datetime.now().hour >= self.config.nightly_maintenance_hour):
+            self._last_nightly_check = now
+            self._spawn(self._nightly_maintenance(), name="memoir-nightly")
 
     def _should_trigger(
         self,
@@ -331,3 +342,32 @@ class BatchScheduler:
                 "[Memoir] TTL: 清理过期原文 %d 条 (retention=%d days)",
                 n, self.config.raw_retention_days,
             )
+
+    async def _nightly_maintenance(self) -> None:
+        """仅补跑启用日期之后、今天之前尚未处理的日期。历史库需面板手动 Preview。"""
+        today = datetime.now().date()
+        def _start_date():
+            raw = self.db.get_meta("nightly_maintenance_started_date")
+            if not raw:
+                raw = today.isoformat()
+                self.db.set_meta("nightly_maintenance_started_date", raw)
+            return raw
+        start = datetime.fromisoformat(await self.db.run(_start_date)).date()
+        day = start
+        while day < today:
+            date_key = day.isoformat()
+            state = await self.db.run(lambda d=date_key: self.db.fetchone(
+                "SELECT status FROM maintenance_days WHERE target_date=?", (d,)))
+            if not state or state["status"] == "failed":
+                begin = int(datetime.combine(day, datetime.min.time()).timestamp())
+                end = int(datetime.combine(day + timedelta(days=1), datetime.min.time()).timestamp())
+                try:
+                    preview = await self.maintenance.preview(
+                        begin, end, run_type="nightly", target_date=date_key)
+                    # 夜间方案由同一套逻辑自动应用；仍完整记录且可一键撤销。
+                    await self.maintenance.apply(preview["id"])
+                    logger.info("[Memoir] nightly maintenance applied for %s", date_key)
+                except Exception as exc:
+                    logger.exception("[Memoir] nightly maintenance failed for %s: %s", date_key, exc)
+                    return
+            day += timedelta(days=1)

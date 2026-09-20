@@ -195,7 +195,10 @@ class EpisodeWriter:
                     packed = struct.pack(f"{len(emb)}f", *emb)
                     duplicate = self.db.fetchone(
                         "SELECT e.id FROM episodes e JOIN episode_vec v ON v.episode_id = e.id "
-                        "WHERE e.session_id = ? "
+                        "WHERE e.session_id = ? AND e.status != 'trashed' "
+                        "AND e.merged_into IS NULL "
+                        "AND COALESCE(e.archive_reason, '') != '用户手动归档' "
+                        "AND (e.protected_until IS NULL OR e.protected_until <= strftime('%s','now')) "
                         "AND vec_distance_cosine(v.embedding, ?) <= 0.025 "
                         "ORDER BY e.id DESC LIMIT 1",
                         (session_id, packed),
@@ -204,7 +207,8 @@ class EpisodeWriter:
                         # 新事件和旧事件高度相同，视为再次提及；不是因误召回而强化。
                         self.db.execute(
                             "UPDATE episodes SET reinforcement_count = reinforcement_count + 1, "
-                            "last_reinforced_at = ?, is_archived = 0, importance = MAX(importance, ?) "
+                            "last_reinforced_at = ?, is_archived = 0, status='active', archive_reason=NULL, "
+                            "importance = MAX(importance, ?) "
                             "WHERE id = ?",
                             (datetime.now(timezone.utc).isoformat(), ev.importance, duplicate["id"]),
                         )
