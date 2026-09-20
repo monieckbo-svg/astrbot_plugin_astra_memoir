@@ -102,6 +102,10 @@
   .empty { color: var(--muted); text-align: center; padding: 20px; font-size: 13px; }
   .loading { color: var(--muted); padding: 12px; font-size: 12px; }
   .error { color: #c33; padding: 10px; border: 1px solid #c33; border-radius: 4px; margin: 10px 0; }
+  .confirm-mask { position: fixed; inset: 0; background: rgba(0,0,0,.45); display:flex;
+    align-items:center; justify-content:center; z-index:9999; }
+  .confirm-box { width:min(440px,calc(100% - 32px)); background:var(--panel);
+    border:1px solid var(--border); border-radius:8px; padding:18px; box-shadow:0 12px 40px rgba(0,0,0,.25); }
 
   #debug .result-row { border-bottom: 1px solid var(--border); padding: 8px 0; }
   #debug .result-scores {
@@ -275,6 +279,19 @@ function apiPost(path, body) {
   return bridge.apiPost(path, body);
 }
 
+function askConfirm(message) {
+  return new Promise(resolve => {
+    const mask = document.createElement('div');
+    mask.className = 'confirm-mask';
+    mask.innerHTML = `<div class="confirm-box"><div style="margin-bottom:16px">${escapeHtml(message)}</div>
+      <div class="toolbar" style="justify-content:flex-end;margin:0"><button data-no>取消</button><button data-yes>确认</button></div></div>`;
+    const finish = value => { mask.remove(); resolve(value); };
+    mask.querySelector('[data-no]').onclick = () => finish(false);
+    mask.querySelector('[data-yes]').onclick = () => finish(true);
+    document.body.appendChild(mask);
+  });
+}
+
 // ============ Tab 切换 ============
 function showTab(name) {
   document.querySelectorAll('.tab-content').forEach(el => el.hidden = true);
@@ -372,7 +389,7 @@ async function mergeIdentities() {
   if (!source_qq_id || !target_qq_id || source_qq_id === target_qq_id) {
     result.textContent = '请选择不同的来源与目标 QQ'; return;
   }
-  if (!confirm(`确认将 QQ ${source_qq_id} 合并到 QQ ${target_qq_id}？`)) return;
+  if (!await askConfirm(`确认将 QQ ${source_qq_id} 合并到 QQ ${target_qq_id}？`)) return;
   try {
     await apiPost('identities/merge', {source_qq_id, target_qq_id});
     result.textContent = '已合并身份';
@@ -491,7 +508,7 @@ async function loadStateEpisodes(status) {
 }
 
 async function episodeAction(id, action, dangerous=false) {
-  if (dangerous && !confirm('永久删除后无法恢复，确认继续？')) return;
+  if (dangerous && !await askConfirm('永久删除后无法恢复，确认继续？')) return;
   try {
     await apiPost(`episodes/${id}/action`, {action});
     if (action === 'undo_edit') { await loadDetail(id); return; }
@@ -676,7 +693,6 @@ async function previewMaintenance() {
   const start_date = document.getElementById('maintStart').value;
   const end_date = document.getElementById('maintEnd').value;
   if (!start_date || !end_date) { result.textContent = '请选择日期范围'; return; }
-  if (!confirm('将先自动备份数据库，然后调用整理模型生成 Preview。此步骤不会修改任何 episode。继续？')) return;
   result.textContent = '正在备份并分批生成方案，请勿重复点击…';
   try {
     await apiPost('maintenance/preview', {start_date, end_date});
@@ -723,13 +739,13 @@ async function showMaintenanceRun(id) {
 }
 
 async function applyMaintenance(id) {
-  if (!confirm('确认应用此 Preview？所有变化会记录，可从本条整理记录一键撤销。')) return;
+  if (!await askConfirm('确认应用此 Preview？所有变化会记录，可从本条整理记录一键撤销。')) return;
   try { await apiPost(`maintenance/runs/${id}/apply`, {}); await loadMaintenanceRuns(); loadStats(); }
   catch (e) { alert(`应用失败：${e.message}`); }
 }
 
 async function undoMaintenance(id) {
-  if (!confirm('确认撤销本次整理并恢复原 episode 状态？')) return;
+  if (!await askConfirm('确认撤销本次整理并恢复原 episode 状态？')) return;
   try { await apiPost(`maintenance/runs/${id}/undo`, {}); await loadMaintenanceRuns(); loadStats(); }
   catch (e) { alert(`撤销失败：${e.message}`); }
 }
