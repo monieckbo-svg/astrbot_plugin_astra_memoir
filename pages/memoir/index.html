@@ -404,14 +404,17 @@ async function loadStats() {
   grid.innerHTML = '<div class="loading">加载中…</div>';
   try {
     const d = await api('stats');
+    const active = d.episodes_active ?? Math.max(0, (d.episodes_total || 0) - (d.episodes_archived || 0) - (d.episodes_trashed || 0));
+    const vectorEligible = Math.max(0, (d.episodes_total || 0) - (d.episodes_trashed || 0));
     const items = [
-      ['Episode 总数', d.episodes_total],
-      ['已归档', d.episodes_archived ?? 0],
+      ['活跃记忆 / 总记忆', `${active} / ${d.episodes_total ?? 0}`],
+      ['归档池', d.episodes_archived ?? 0],
+      ['回收站', d.episodes_trashed ?? 0],
       ['今日新增', d.episodes_today],
       ['Raw 总数', d.raw_total],
       ['Raw 未处理', d.raw_unprocessed],
       ['缺失向量', d.vec_missing],
-      ['Vector coverage', `${d.vec_covered} / ${d.episodes_total}`],
+      ['Vector coverage（非回收站）', `${d.vec_covered} / ${vectorEligible}`],
       ['Embedding provider', d.embedding_provider_name],
       ['Provider ID', d.embedding_provider_id],
       ['Dimension', d.embedding_dim],

@@ -26,7 +26,8 @@ const bridge = {
   async apiGet(route) {
     calls.push(route);
     if (route === 'stats') return {
-      episodes_total: 1, episodes_today: 1, raw_total: 1, raw_unprocessed: 0,
+      episodes_total: 3, episodes_active: 1, episodes_archived: 1, episodes_trashed: 1,
+      episodes_today: 1, raw_total: 1, raw_unprocessed: 0,
       vec_missing: 0, vec_covered: 1, scheduler_running: true,
       embedding_provider_name: 'test', embedding_provider_id: 'test',
       embedding_dim: 8, embedding_status: 'ok', active_sessions: [],
@@ -59,7 +60,8 @@ vm.runInNewContext(script, sandbox);
 (async () => {
   await new Promise(resolve => setImmediate(resolve));
   await sandbox.loadStats();
-  assert.match(element('statsGrid').innerHTML, /Episode 总数/);
+  assert.match(element('statsGrid').innerHTML, /活跃记忆 \/ 总记忆/);
+  assert.match(element('statsGrid').innerHTML, /1 \/ 3/);
   await sandbox.loadEpisodes();
   assert.match(element('episodesList').innerHTML, /真实记忆/);
   await sandbox.loadIdentities();
