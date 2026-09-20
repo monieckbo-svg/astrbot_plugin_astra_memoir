@@ -92,7 +92,15 @@ class MaintenanceManager:
             prompt = "<episodes>\n" + json.dumps(payload, ensure_ascii=False) + "\n</episodes>"
             if attempt:
                 prompt += "\n上次输出无效，请覆盖每个 id 恰好一次并严格遵守 schema。"
-            resp = await provider.text_chat(prompt=prompt, system_prompt=MAINTENANCE_PROMPT)
+            try:
+                resp = await asyncio.wait_for(
+                    provider.text_chat(prompt=prompt, system_prompt=MAINTENANCE_PROMPT),
+                    timeout=120,
+                )
+            except asyncio.TimeoutError:
+                if attempt == 0:
+                    continue
+                raise MaintenanceError("整理模型单批连续两次超过 120 秒")
             text = getattr(resp, "completion_text", "") or ""
             match = re.search(r"\{[\s\S]*\}", text)
             try:
@@ -156,11 +164,15 @@ class MaintenanceManager:
                     "GROUP BY e.id ORDER BY e.event_start_at,e.id", (start_ts, end_ts, now))
                 return [dict(r) for r in rows]
             rows = await self.db.run(_load)
+            batches = self._small_batches(rows)
             await self.db.run(lambda: self.db.execute(
-                "UPDATE maintenance_runs SET source_count=? WHERE id=?", (len(rows), run_id)))
+                "UPDATE maintenance_runs SET source_count=?,batch_count=? WHERE id=?",
+                (len(rows), len(batches), run_id)))
             decisions = []
-            for batch in self._small_batches(rows):
+            for completed, batch in enumerate(batches, 1):
                 decisions.extend(await self._ask(batch))
+                await self.db.run(lambda n=completed: self.db.execute(
+                    "UPDATE maintenance_runs SET completed_batches=? WHERE id=?", (n, run_id)))
             row_map = {r["id"]: r for r in rows}
             def _save():
                 counts = {"keep": 0, "archive": 0, "merge_sources": 0, "merge_results": 0}

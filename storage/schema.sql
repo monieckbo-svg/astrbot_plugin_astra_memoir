@@ -169,6 +169,8 @@ CREATE TABLE IF NOT EXISTS maintenance_runs (
     archive_count INTEGER NOT NULL DEFAULT 0,
     merge_source_count INTEGER NOT NULL DEFAULT 0,
     merge_result_count INTEGER NOT NULL DEFAULT 0,
+    batch_count INTEGER NOT NULL DEFAULT 0,
+    completed_batches INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     applied_at INTEGER,
     undone_at INTEGER,

@@ -714,6 +714,7 @@ async function loadMaintenanceRuns() {
     wrap.innerHTML = runs.map(r => `<div class="card">
       <div class="ep-title">#${r.id} ${r.run_type === 'nightly' ? '每日整理' : '历史整理'} · ${escapeHtml(r.status)}</div>
       <div class="ep-meta">原始 ${r.source_count} 条 → 保留 ${r.keep_count} → ${r.merge_source_count} 条合并成 ${r.merge_result_count} 条 → 归档 ${r.archive_count} → 自动删除 0</div>
+      ${r.status === 'generating' ? `<div class="ep-meta">模型整理进度：${r.completed_batches || 0} / ${r.batch_count || '?'} 批</div>` : ''}
       <div class="ep-meta">备份：${escapeHtml(r.backup_path || '-')}</div>
       <div class="toolbar"><button onclick="showMaintenanceRun(${r.id})">查看方案</button>
       ${r.status === 'preview' ? `<button onclick="applyMaintenance(${r.id})">应用整理结果</button>` : ''}
