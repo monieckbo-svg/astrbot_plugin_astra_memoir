@@ -29,6 +29,19 @@ class Extractor:
     def _get_provider(self): return Provider()
 
 
+class BadPerspectiveProvider:
+    async def text_chat(self, prompt, system_prompt):
+        items = json.loads(prompt.split("<episodes>\n",1)[1].split("\n</episodes>",1)[0])
+        return SimpleNamespace(completion_text=json.dumps({"decisions":[{
+            "action":"merge", "ids":[x["id"] for x in items], "title":"我的总结",
+            "content":"我记录了群友的事情。", "importance":3, "reason":"错误人称"
+        }]}, ensure_ascii=False))
+
+
+class BadExtractor:
+    def _get_provider(self): return BadPerspectiveProvider()
+
+
 async def main():
     with tempfile.TemporaryDirectory() as tmp:
         db = MemoirDB(Path(tmp)/"memoir.db", 8); db.initialize()
@@ -44,6 +57,17 @@ async def main():
             vec.upsert(eid,await emb.get_embedding(title+content),chat_type="private",session_id="s",group_id=None)
             ids.append(eid)
         manager=MaintenanceManager(db,vec,writer,Extractor(),batch_size=12)
+        bad_manager=MaintenanceManager(db,vec,writer,BadExtractor(),batch_size=12)
+        fallback=await bad_manager._ask([
+            {"id":901,"title":"群友事件1","content":"小雨说了事情","importance":3,
+             "chat_type":"group","event_start_at":now,"edited_by_user":False,
+             "participants":[{"name":"小雨","role":"user"}]},
+            {"id":902,"title":"群友事件2","content":"糖豆补充了事情","importance":3,
+             "chat_type":"group","event_start_at":now,"edited_by_user":False,
+             "participants":[{"name":"糖豆","role":"user"}]},
+        ])
+        assert all(x["action"]=="keep" for x in fallback)
+        assert all("安全保留" in x["reason"] for x in fallback)
         scale_rows=[{"id":1000+i,"title":f"主题{i%9}","content":f"内容{i%9}","keywords":"",
                      "event_start_at":now+(i%3)*86400,"chat_type":"private","session_id":"s","group_id":None}
                     for i in range(469)]

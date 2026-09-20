@@ -95,19 +95,22 @@ class MaintenanceManager:
                     "time": datetime.fromtimestamp(r["event_start_at"]).isoformat()}
                    for r in rows]
         expected = {r["id"] for r in rows}
-        for attempt in range(2):
+        validation_error = ""
+        for attempt in range(3):
             prompt = "<episodes>\n" + json.dumps(payload, ensure_ascii=False) + "\n</episodes>"
             if attempt:
-                prompt += "\n上次输出无效，请覆盖每个 id 恰好一次并严格遵守 schema。"
+                prompt += ("\n上次输出被硬校验拒绝，原因：" + validation_error +
+                           "。请修正后重新输出完整 JSON；覆盖每个 id 恰好一次。")
             try:
                 resp = await asyncio.wait_for(
                     provider.text_chat(prompt=prompt, system_prompt=MAINTENANCE_PROMPT),
                     timeout=120,
                 )
             except asyncio.TimeoutError:
-                if attempt == 0:
+                if attempt < 2:
+                    validation_error = "模型调用超过120秒"
                     continue
-                raise MaintenanceError("整理模型单批连续两次超过 120 秒")
+                raise MaintenanceError("整理模型单批连续三次超过 120 秒")
             text = getattr(resp, "completion_text", "") or ""
             match = re.search(r"\{[\s\S]*\}", text)
             try:
@@ -117,17 +120,20 @@ class MaintenanceManager:
                     action, ids = d.get("action"), d.get("ids")
                     importance = d.get("importance")
                     if action not in ("keep", "archive", "merge") or not isinstance(ids, list):
-                        raise ValueError
-                    ids = [int(i) for i in ids]
+                        raise ValueError("action 必须是 keep/archive/merge，ids 必须为数组")
+                    try:
+                        ids = [int(i) for i in ids]
+                    except (TypeError, ValueError):
+                        raise ValueError("ids 必须全部是整数")
                     if not ids or set(ids) - expected or seen & set(ids):
-                        raise ValueError
+                        raise ValueError("ids 为空、越界或重复出现")
                     if action in ("keep", "archive") and len(ids) != 1:
-                        raise ValueError
+                        raise ValueError("keep/archive 每项只能包含一个 id")
                     if action == "merge" and (len(ids) < 2 or not str(d.get("title", "")).strip()
                                               or not str(d.get("content", "")).strip()):
-                        raise ValueError
+                        raise ValueError("merge 至少需要两个 id，且必须有完整 title/content")
                     if action == "merge" and any(r["id"] in ids and r.get("edited_by_user") for r in rows):
-                        raise ValueError
+                        raise ValueError("merge 包含 edited_by_user=true 的用户手工记忆")
                     if action == "merge":
                         astra_participated = any(
                             r["id"] in ids and any(
@@ -136,17 +142,27 @@ class MaintenanceManager:
                         )
                         merged_text = f"{d.get('title', '')}\n{d.get('content', '')}"
                         if not astra_participated and "我" in merged_text:
-                            raise ValueError
+                            raise ValueError(
+                                f"merge ids={ids} 没有 Astra(role=assistant) 参与，禁止使用‘我/我们’；"
+                                "请用 participants 中的正式名字作第三人称记录")
                     if type(importance) is not int or not 1 <= importance <= 5:
-                        raise ValueError
+                        raise ValueError("importance 必须是 1~5 的整数")
                     seen.update(ids)
                     valid.append({**d, "ids": ids})
                 if seen != expected:
-                    raise ValueError
+                    raise ValueError(f"未恰好覆盖全部输入 id，缺少 {sorted(expected-seen)}")
                 return valid
-            except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                validation_error = str(exc) or "JSON/schema 不合法"
                 continue
-        raise MaintenanceError("整理模型连续两次返回无效方案")
+        logger.warning(
+            "[Memoir] maintenance batch ids=%s failed validation 3 times (%s); safe-keep fallback",
+            sorted(expected), validation_error,
+        )
+        return [{"action": "keep", "ids": [r["id"]],
+                 "importance": int(r["importance"]),
+                 "reason": f"模型连续输出无效，安全保留：{validation_error}"}
+                for r in rows]
 
     async def preview(self, start_ts: int, end_ts: int, *, run_type: str = "history",
                       target_date: str | None = None) -> dict:
