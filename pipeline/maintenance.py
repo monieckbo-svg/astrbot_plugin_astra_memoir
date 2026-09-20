@@ -285,6 +285,29 @@ class MaintenanceManager:
         return [dict(r) for r in self.db.fetchall(
             "SELECT * FROM maintenance_runs ORDER BY created_at DESC,id DESC LIMIT 100")]
 
+    def delete_run_record(self, run_id: int) -> dict:
+        """Discard an unused Preview or remove a failed run from panel history.
+
+        The database backup is deliberately preserved. Applied/undone runs remain as
+        the audit trail needed to explain or verify episode state changes.
+        """
+        run = self.db.fetchone("SELECT * FROM maintenance_runs WHERE id=?", (run_id,))
+        if not run:
+            raise ValueError("整理记录不存在")
+        if run["status"] not in ("preview", "failed"):
+            raise ValueError("只能删除失败记录或放弃尚未应用的 Preview")
+        backup_path = run["backup_path"]
+        with self.db.transaction():
+            self.db.execute("DELETE FROM maintenance_days WHERE run_id=?", (run_id,))
+            self.db.execute("DELETE FROM maintenance_actions WHERE run_id=?", (run_id,))
+            self.db.execute("DELETE FROM maintenance_runs WHERE id=?", (run_id,))
+        return {
+            "deleted": True,
+            "run_id": run_id,
+            "backup_path": backup_path,
+            "backup_preserved": True,
+        }
+
     async def apply(self, run_id: int) -> dict:
         async with self._run_lock:
             return await self._apply_unlocked(run_id)

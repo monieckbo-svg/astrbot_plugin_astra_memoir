@@ -521,6 +521,13 @@ class MemoirPanel:
         try: return {"status": "ok", "data": await self.maintenance.undo(int(run_id))}
         except Exception as e: return {"status": "error", "message": str(e)}
 
+    async def maintenance_delete(self, run_id: str) -> dict:
+        try:
+            data = await self.db.run(self.maintenance.delete_run_record, int(run_id))
+            return {"status": "ok", "data": data}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
     # ---------- debug recall ----------
 
     async def debug_recall(self) -> dict:
@@ -635,6 +642,7 @@ def register_panel_routes(context, panel: MemoirPanel):
     async def h_maintenance_detail(run_id: str): return await panel.maintenance_detail(run_id)
     async def h_maintenance_apply(run_id: str): return await panel.maintenance_apply(run_id)
     async def h_maintenance_undo(run_id: str): return await panel.maintenance_undo(run_id)
+    async def h_maintenance_delete(run_id: str): return await panel.maintenance_delete(run_id)
 
     context.register_web_api(
         f"{_ROUTE_PREFIX}/stats", h_stats, methods=["GET"],
@@ -689,5 +697,7 @@ def register_panel_routes(context, panel: MemoirPanel):
                              methods=["POST"], desc="Apply preview")
     context.register_web_api(f"{_ROUTE_PREFIX}/maintenance/runs/<run_id>/undo", h_maintenance_undo,
                              methods=["POST"], desc="Undo applied maintenance")
+    context.register_web_api(f"{_ROUTE_PREFIX}/maintenance/runs/<run_id>/delete", h_maintenance_delete,
+                             methods=["POST"], desc="Discard preview or delete failed run record")
 
-    logger.info("[Memoir] panel API endpoints registered (16 routes)")
+    logger.info("[Memoir] panel API endpoints registered (17 routes)")

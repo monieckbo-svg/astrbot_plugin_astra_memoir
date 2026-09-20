@@ -43,6 +43,20 @@
     background: var(--panel); border: 1px solid var(--border);
     border-radius: 6px; padding: 14px; margin-bottom: 12px;
   }
+  .maintenance-run.run-applied,
+  .maintenance-run.run-undone {
+    background: color-mix(in srgb, var(--panel) 88%, #888 12%);
+    border-color: color-mix(in srgb, var(--border) 65%, #888 35%);
+  }
+  .maintenance-run.run-failed { border-color: #cf7777; }
+  .run-status {
+    display: inline-block; margin-left: 5px; padding: 1px 7px;
+    border-radius: 999px; font-size: 11px; font-weight: 500;
+    color: var(--text); background: var(--bg); border: 1px solid var(--border);
+  }
+  .run-status.status-applied,
+  .run-status.status-undone { color: var(--muted); }
+  .run-status.status-failed { color: #c33; border-color: #cf7777; }
   .stats-grid {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
     gap: 10px; margin-bottom: 16px;
@@ -714,15 +728,21 @@ async function loadMaintenanceRuns() {
   try {
     const runs = await api('maintenance/runs');
     if (!runs.length) { wrap.innerHTML = '<div class="empty">暂无整理记录</div>'; return; }
-    wrap.innerHTML = runs.map(r => `<div class="card">
-      <div class="ep-title">#${r.id} ${r.run_type === 'nightly' ? '每日整理' : '历史整理'} · ${escapeHtml(r.status)}</div>
+    const statusLabels = {
+      generating: '生成中', preview: '待确认', applied: '已应用（仍可撤销）',
+      undone: '已撤销', failed: '失败'
+    };
+    wrap.innerHTML = runs.map(r => `<div class="card maintenance-run run-${escapeHtml(r.status)}">
+      <div class="ep-title">#${r.id} ${r.run_type === 'nightly' ? '每日整理' : '历史整理'}<span class="run-status status-${escapeHtml(r.status)}">${escapeHtml(statusLabels[r.status] || r.status)}</span></div>
       <div class="ep-meta">原始 ${r.source_count} 条 → 保留 ${r.keep_count} → ${r.merge_source_count} 条合并成 ${r.merge_result_count} 条 → 归档 ${r.archive_count} → 自动删除 0</div>
       ${r.status === 'generating' ? `<div class="ep-meta">模型整理进度：${r.completed_batches || 0} / ${r.batch_count || '?'} 批</div>` : ''}
       ${r.status === 'failed' ? `<div class="error">失败原因：${escapeHtml(r.error || '未知错误，请查看 AstrBot 日志')}</div>` : ''}
       <div class="ep-meta">备份：${escapeHtml(r.backup_path || '-')}</div>
-      <div class="toolbar"><button onclick="showMaintenanceRun(${r.id})">查看方案</button>
+      <div class="toolbar">${r.status !== 'failed' ? `<button onclick="showMaintenanceRun(${r.id})">查看方案</button>` : ''}
       ${r.status === 'preview' && (r.logic_version || 1) >= 2 ? `<button onclick="applyMaintenance(${r.id})">应用整理结果</button>` : ''}
       ${r.status === 'preview' && (r.logic_version || 1) < 2 ? `<span class="error">旧版人称规则方案，已禁用；请重新生成 Preview</span>` : ''}
+      ${r.status === 'preview' ? `<button onclick="deleteMaintenanceRun(${r.id},'preview')">放弃方案</button>` : ''}
+      ${r.status === 'failed' ? `<button onclick="deleteMaintenanceRun(${r.id},'failed')">删除失败记录</button>` : ''}
       ${r.status === 'applied' ? `<button onclick="undoMaintenance(${r.id})">撤销本次整理</button>` : ''}</div>
       <div id="run-${r.id}"></div></div>`).join('');
   } catch (e) { wrap.innerHTML = `<div class="error">${escapeHtml(e.message)}</div>`; }
@@ -754,6 +774,15 @@ async function undoMaintenance(id) {
   if (!await askConfirm('确认撤销本次整理并恢复原 episode 状态？')) return;
   try { await apiPost(`maintenance/runs/${id}/undo`, {}); await loadMaintenanceRuns(); loadStats(); }
   catch (e) { alert(`撤销失败：${e.message}`); }
+}
+
+async function deleteMaintenanceRun(id, kind) {
+  const message = kind === 'preview'
+    ? '确认放弃此 Preview？不会修改任何 episode，已生成的数据库备份仍会保留。'
+    : '确认删除这条失败记录？只会清理面板记录，数据库备份仍会保留。';
+  if (!await askConfirm(message)) return;
+  try { await apiPost(`maintenance/runs/${id}/delete`, {}); await loadMaintenanceRuns(); }
+  catch (e) { alert(`删除失败：${e.message}`); }
 }
 
 // ============ Utils ============

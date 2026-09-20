@@ -106,6 +106,15 @@ async def main():
             raise AssertionError("Preview 后的用户编辑必须阻止应用")
         except ValueError as exc:
             assert "已变化" in str(exc)
+        deleted=manager.delete_run_record(preview2["id"])
+        assert deleted["deleted"] and deleted["backup_preserved"]
+        assert Path(deleted["backup_path"]).exists()
+        assert db.fetchone("SELECT 1 FROM maintenance_runs WHERE id=?",(preview2["id"],)) is None
+        try:
+            manager.delete_run_record(preview["id"])
+            raise AssertionError("已撤销的整理记录必须保留作为审计")
+        except ValueError as exc:
+            assert "只能删除" in str(exc)
         await manager.undo_latest_edit(ids[0])
         assert db.fetchone("SELECT title FROM episodes WHERE id=?",(ids[0],))[0]=="插件开发1"
         manager.manual_state(ids[0],"trash")
