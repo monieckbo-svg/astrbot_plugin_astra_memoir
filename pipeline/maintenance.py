@@ -142,9 +142,20 @@ class MaintenanceManager:
                         )
                         merged_text = f"{d.get('title', '')}\n{d.get('content', '')}"
                         if not astra_participated and "我" in merged_text:
-                            raise ValueError(
+                            message = (
                                 f"merge ids={ids} 没有 Astra(role=assistant) 参与，禁止使用‘我/我们’；"
                                 "请用 participants 中的正式名字作第三人称记录")
+                            if attempt < 2:
+                                raise ValueError(message)
+                            # 第三次仍犯同一人称错误时，仅拆回该 merge；同批其它合法判断保留。
+                            by_id = {r["id"]: r for r in rows}
+                            seen.update(ids)
+                            valid.extend({
+                                "action": "keep", "ids": [eid],
+                                "importance": int(by_id[eid]["importance"]),
+                                "reason": f"合并摘要人称不安全，安全保留：{message}",
+                            } for eid in ids)
+                            continue
                     if type(importance) is not int or not 1 <= importance <= 5:
                         raise ValueError("importance 必须是 1~5 的整数")
                     seen.update(ids)

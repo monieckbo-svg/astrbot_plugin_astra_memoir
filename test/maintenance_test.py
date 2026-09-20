@@ -32,10 +32,15 @@ class Extractor:
 class BadPerspectiveProvider:
     async def text_chat(self, prompt, system_prompt):
         items = json.loads(prompt.split("<episodes>\n",1)[1].split("\n</episodes>",1)[0])
-        return SimpleNamespace(completion_text=json.dumps({"decisions":[{
+        decisions=[{
             "action":"merge", "ids":[x["id"] for x in items], "title":"我的总结",
             "content":"我记录了群友的事情。", "importance":3, "reason":"错误人称"
-        }]}, ensure_ascii=False))
+        }]
+        if len(items) >= 3:
+            decisions[0]["ids"] = [items[0]["id"], items[1]["id"]]
+            decisions.append({"action":"archive","ids":[items[2]["id"]],
+                              "importance":1,"reason":"一次性闲聊"})
+        return SimpleNamespace(completion_text=json.dumps({"decisions":decisions}, ensure_ascii=False))
 
 
 class BadExtractor:
@@ -65,9 +70,12 @@ async def main():
             {"id":902,"title":"群友事件2","content":"糖豆补充了事情","importance":3,
              "chat_type":"group","event_start_at":now,"edited_by_user":False,
              "participants":[{"name":"糖豆","role":"user"}]},
+            {"id":903,"title":"一次性闲聊","content":"哈哈","importance":2,
+             "chat_type":"group","event_start_at":now,"edited_by_user":False,
+             "participants":[{"name":"糖豆","role":"user"}]},
         ])
-        assert all(x["action"]=="keep" for x in fallback)
-        assert all("安全保留" in x["reason"] for x in fallback)
+        assert [x["action"] for x in fallback] == ["keep", "keep", "archive"]
+        assert all("安全保留" in x["reason"] for x in fallback[:2])
         scale_rows=[{"id":1000+i,"title":f"主题{i%9}","content":f"内容{i%9}","keywords":"",
                      "event_start_at":now+(i%3)*86400,"chat_type":"private","session_id":"s","group_id":None}
                     for i in range(469)]
