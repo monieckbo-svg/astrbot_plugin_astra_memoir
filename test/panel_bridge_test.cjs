@@ -21,9 +21,10 @@ const episode = {
   raw_evidence: [], raw_missing_ids: [],
 };
 const calls = [];
+let lastEpisodeParams = null;
 const bridge = {
   ready: async () => {},
-  async apiGet(route) {
+  async apiGet(route, params) {
     calls.push(route);
     if (route === 'stats') return {
       episodes_total: 3, episodes_active: 1, episodes_archived: 1, episodes_trashed: 1,
@@ -32,7 +33,7 @@ const bridge = {
       embedding_provider_name: 'test', embedding_provider_id: 'test',
       embedding_dim: 8, embedding_status: 'ok', active_sessions: [],
     };
-    if (route === 'episodes') return [episode];
+    if (route === 'episodes') { lastEpisodeParams = params; return [episode]; }
     if (route === 'identities') return [{qq_id: '111', canonical_name: '陆忱',
       pronoun: 'TA', person_type: 'human', aliases: ['喵日天'], linked_qq_ids: []}];
     if (route === 'episodes/7') return episode;
@@ -64,6 +65,9 @@ vm.runInNewContext(script, sandbox);
   assert.match(element('statsGrid').innerHTML, /1 \/ 3/);
   await sandbox.loadEpisodes();
   assert.match(element('episodesList').innerHTML, /真实记忆/);
+  assert.equal(calls[2], 'episodes');
+  assert.equal(lastEpisodeParams.limit, 21);
+  assert.equal(lastEpisodeParams.offset, 0);
   await sandbox.loadIdentities();
   assert.match(element('identityList').innerHTML, /喵日天/);
   await sandbox.loadDetail(7);

@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import types
+from datetime import datetime
 from pathlib import Path
 
 
@@ -689,6 +690,13 @@ async def test_17_panel_invalid_fts_query_falls_back():
     result = await panel.list_episodes()
     assert result["status"] == "ok", result
     assert [e["id"] for e in result["data"]] == [eid], result
+    request.query = {"date": datetime.fromtimestamp(now).strftime("%Y-%m-%d"), "status": "active"}
+    dated = await panel.list_episodes()
+    assert [e["id"] for e in dated["data"]] == [eid], dated
+    request.query = {"date": "2000-01-01", "status": "active"}
+    assert (await panel.list_episodes())["data"] == []
+    request.query = {"date": "not-a-date"}
+    assert (await panel.list_episodes())["status"] == "error"
     request.query = {}
     db.close()
     print("✓ 17. Panel 非法 FTS 语法退回字面搜索，仍保留参与者筛选")

@@ -169,20 +169,23 @@
       <select id="epArchived">
         <option value="active">活跃记忆</option>
       </select>
+      <label>日期 <input type="date" id="epDate"></label>
       <input type="search" id="epSearch" placeholder="搜索标题/内容/关键词（FTS）">
       <input type="text" id="epParticipant" placeholder="Participant QQ" style="width: 120px">
-      <button onclick="loadEpisodes()">筛选</button>
+      <button onclick="loadEpisodes(true)">筛选</button><button onclick="clearEpisodeDate('active')">全部日期</button>
     </div>
     <div id="episodesList"><div class="loading">加载中…</div></div>
   </div>
 
   <div id="archive" class="tab-content" hidden>
     <div class="card">归档内容不参与普通自动召回，但仍可查看、编辑、恢复或移入回收站。</div>
+    <div class="toolbar"><label>日期 <input type="date" id="archiveDate"></label><button onclick="loadStateEpisodes('archived',true)">筛选</button><button onclick="clearEpisodeDate('archived')">全部日期</button></div>
     <div id="archiveList"><div class="loading">加载中…</div></div>
   </div>
 
   <div id="trash" class="tab-content" hidden>
     <div class="card">这里只放用户删除或撤销整理产生的内容。自动整理不会永久删除；永久删除仅能在此手动执行。</div>
+    <div class="toolbar"><label>日期 <input type="date" id="trashDate"></label><button onclick="loadStateEpisodes('trashed',true)">筛选</button><button onclick="clearEpisodeDate('trashed')">全部日期</button></div>
     <div id="trashList"><div class="loading">加载中…</div></div>
   </div>
 
@@ -472,21 +475,55 @@ async function repairVectors() {
 }
 
 // ============ Episodes 列表 ============
-async function loadEpisodes() {
+const EPISODE_PAGE_SIZE = 20;
+const episodePages = {active: 1, archived: 1, trashed: 1};
+
+function episodePager(status, hasNext) {
+  const page = episodePages[status];
+  if (page === 1 && !hasNext) return '';
+  return `<div class="toolbar" style="justify-content:center;align-items:center">
+    <button ${page <= 1 ? 'disabled' : ''} onclick="changeEpisodePage('${status}',-1)">上一页</button>
+    <span class="ep-meta" style="margin:0">第 ${page} 页</span>
+    <button ${!hasNext ? 'disabled' : ''} onclick="changeEpisodePage('${status}',1)">下一页</button>
+  </div>`;
+}
+
+function changeEpisodePage(status, delta) {
+  episodePages[status] = Math.max(1, episodePages[status] + delta);
+  if (status === 'active') loadEpisodes();
+  else loadStateEpisodes(status);
+}
+
+function clearEpisodeDate(status) {
+  const id = status === 'active' ? 'epDate' : (status === 'archived' ? 'archiveDate' : 'trashDate');
+  document.getElementById(id).value = '';
+  if (status === 'active') loadEpisodes(true);
+  else loadStateEpisodes(status, true);
+}
+
+async function loadEpisodes(resetPage=false) {
   const wrap = document.getElementById('episodesList');
   wrap.innerHTML = '<div class="loading">加载中…</div>';
+  if (resetPage) episodePages.active = 1;
   const params = {};
   const ct = document.getElementById('epChatType').value;
+  const date = document.getElementById('epDate').value;
   const q = document.getElementById('epSearch').value.trim();
   const pt = document.getElementById('epParticipant').value.trim();
   const status = document.getElementById('epArchived').value;
   if (ct) params.chat_type = ct;
+  if (date) params.date = date;
   if (q) params.q = q;
   if (pt) params.participant = pt;
   if (status) params.status = status;
+  params.limit = EPISODE_PAGE_SIZE + 1;
+  params.offset = (episodePages.active - 1) * EPISODE_PAGE_SIZE;
   try {
-    const eps = await api('episodes', params);
+    const rows = await api('episodes', params);
+    const hasNext = rows.length > EPISODE_PAGE_SIZE;
+    const eps = rows.slice(0, EPISODE_PAGE_SIZE);
     if (!eps.length) {
+      if (episodePages.active > 1) { episodePages.active--; return loadEpisodes(); }
       wrap.innerHTML = '<div class="empty">没有匹配的 episode</div>';
       return;
     }
@@ -501,26 +538,36 @@ async function loadEpisodes() {
         <div class="ep-content">${escapeHtml(ep.content)}</div>
         <div class="ep-parts">参与者：${escapeHtml(parts)}</div>
       </div>`;
-    }).join('');
+    }).join('') + episodePager('active', hasNext);
   } catch (e) {
     wrap.innerHTML = `<div class="error">${e.message}</div>`;
   }
 }
 
-async function loadStateEpisodes(status) {
+async function loadStateEpisodes(status, resetPage=false) {
   const wrap = document.getElementById(status === 'archived' ? 'archiveList' : 'trashList');
   wrap.innerHTML = '<div class="loading">加载中…</div>';
+  if (resetPage) episodePages[status] = 1;
+  const date = document.getElementById(status === 'archived' ? 'archiveDate' : 'trashDate').value;
+  const params = {status, limit: EPISODE_PAGE_SIZE + 1,
+    offset: (episodePages[status] - 1) * EPISODE_PAGE_SIZE};
+  if (date) params.date = date;
   try {
-    const eps = await api('episodes', {status, limit: 200});
-    if (!eps.length) { wrap.innerHTML = '<div class="empty">这里是空的</div>'; return; }
+    const rows = await api('episodes', params);
+    const hasNext = rows.length > EPISODE_PAGE_SIZE;
+    const eps = rows.slice(0, EPISODE_PAGE_SIZE);
+    if (!eps.length) {
+      if (episodePages[status] > 1) { episodePages[status]--; return loadStateEpisodes(status); }
+      wrap.innerHTML = '<div class="empty">这里是空的</div>'; return;
+    }
     wrap.innerHTML = eps.map(ep => `<div class="card">
       <div class="ep-title" onclick="loadDetail(${ep.id})" style="cursor:pointer">#${ep.id} ${escapeHtml(ep.title)}</div>
-      <div class="ep-meta">importance=${ep.importance} · ${escapeHtml(ep.archive_reason || '未记录原因')}</div>
+      <div class="ep-meta">${new Date(ep.event_start_at * 1000).toLocaleString()} · importance=${ep.importance} · ${escapeHtml(ep.archive_reason || '未记录原因')}</div>
       <div class="ep-content">${escapeHtml(ep.content)}</div>
       <div class="toolbar"><button onclick="episodeAction(${ep.id},'restore')">恢复</button>
       <button onclick="loadDetail(${ep.id})">编辑/详情</button>
       ${status === 'archived' ? `<button onclick="episodeAction(${ep.id},'trash')">删除到回收站</button>` : `<button onclick="episodeAction(${ep.id},'permanent_delete',true)">永久删除</button>`}
-      </div></div>`).join('');
+      </div></div>`).join('') + episodePager(status, hasNext);
   } catch (e) { wrap.innerHTML = `<div class="error">${escapeHtml(e.message)}</div>`; }
 }
 

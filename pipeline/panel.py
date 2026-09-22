@@ -203,12 +203,21 @@ class MemoirPanel:
         archived = _query("archived")
         status = _query("status")
         search = _query("q")
+        date_filter = str(_query("date", "") or "").strip()
+        date_start = date_end = None
+        if date_filter:
+            try:
+                day = datetime.strptime(date_filter, "%Y-%m-%d")
+                date_start = int(day.timestamp())
+                date_end = int((day + timedelta(days=1)).timestamp())
+            except ValueError:
+                return {"status": "error", "message": "日期格式必须是 YYYY-MM-DD", "data": []}
         try:
-            limit = min(int(_query("limit", 50)), 200)
+            limit = max(1, min(int(_query("limit", 50)), 200))
         except (TypeError, ValueError):
             limit = 50
         try:
-            offset = int(_query("offset", 0))
+            offset = max(0, int(_query("offset", 0)))
         except (TypeError, ValueError):
             offset = 0
 
@@ -231,6 +240,10 @@ class MemoirPanel:
             if status in ("active", "archived", "trashed"):
                 conditions.append("status = ?")
                 params.append(status)
+            if date_start is not None and date_end is not None:
+                # Include an episode when any part of its event overlaps the day.
+                conditions.extend(("event_start_at < ?", "event_end_at >= ?"))
+                params.extend((date_end, date_start))
 
             if search:
                 sql = (
