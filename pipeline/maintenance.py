@@ -11,8 +11,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from astrbot.api import logger
+from .extractor import suspected_name_drift
 
-MAINTENANCE_LOGIC_VERSION = 2
+MAINTENANCE_LOGIC_VERSION = 3
 
 
 MAINTENANCE_PROMPT = """你是 Astra Memoir 的记忆整理器。你不是写日报，而是在同一小批独立 episode 中判断长期价值。
@@ -21,6 +22,7 @@ MAINTENANCE_PROMPT = """你是 Astra Memoir 的记忆整理器。你不是写日
 普通画图请求、表情包、一次性玩笑、重复闲聊、无后续小事优先 archive；明确决定、人物状态变化、项目进展、新设定、持续话题和有后续影响的互动保留。
 同一持续事件的碎片可以 merge；不同主题绝不能因为同一天而合并。merge 必须写成一条自然、完整、忠实的事件记忆，不添加原文没有的事实。
 人称规则是硬规则：只有输入中 astra_participated=true，且事实确实是 role=assistant 的 Astra 所做或所说，才能用“我”指代 Astra；群友或其他 AI 的言行必须使用 participants 中的正式名字。若 astra_participated=false，标题和正文都禁止使用“我/我们”，必须客观第三人称记录，也不要虚构“我看到/我得知”。
+姓名规则是硬规则：participants 中的正式名字必须逐字复制，标题和正文必须一致；不得改同音字、形近字或自行润色姓名。
 每个输入 id 必须且只能出现一次。keep/archive 的 ids 必须只有一个；merge 至少两个。
 edited_by_user=true 的正文是用户手工事实，绝不能 merge 或改写；过保护期后只能 keep 或 archive。
 importance 为 1~5 的重新评估结果。
@@ -156,6 +158,18 @@ class MaintenanceManager:
                                 "reason": f"合并摘要人称不安全，安全保留：{message}",
                             } for eid in ids)
                             continue
+                        participant_names = {
+                            str(p.get("name", "")).strip()
+                            for r in rows if r["id"] in ids
+                            for p in r.get("participants", [])
+                            if str(p.get("name", "")).strip()
+                        }
+                        name_error = suspected_name_drift(
+                            str(d.get("title", "")), str(d.get("content", "")),
+                            participant_names,
+                        )
+                        if name_error:
+                            raise ValueError(name_error)
                     if type(importance) is not int or not 1 <= importance <= 5:
                         raise ValueError("importance 必须是 1~5 的整数")
                     seen.update(ids)

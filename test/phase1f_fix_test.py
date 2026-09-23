@@ -546,6 +546,16 @@ async def test_11_partial_invalid_is_atomic():
         {"title": "坏", "content": "事", "importance": 3, "source_raw_ids": [999]},
     ]}), new_msg_ids={1}, overlap_msg_ids=set())
     assert not result.success and result.events == [] and result.rejected_count == 1
+    wrong_name = parse(json.dumps({"events": [{
+        "title": "陆忱修复插件", "content": "陆澈正在修复插件", "importance": 3,
+        "source_raw_ids": [1], "keywords": ["插件"]
+    }]}), new_msg_ids={1}, overlap_msg_ids=set(), canonical_names={"陆忱"})
+    assert not wrong_name.success and wrong_name.rejected_count == 1
+    correct_name = parse(json.dumps({"events": [{
+        "title": "陆忱修复插件", "content": "陆忱正在修复插件", "importance": 3,
+        "source_raw_ids": [1], "keywords": ["插件"]
+    }]}), new_msg_ids={1}, overlap_msg_ids=set(), canonical_names={"陆忱"})
+    assert correct_name.success
     print("✓ 11. 混合合法/非法事件整批拒绝")
 
 

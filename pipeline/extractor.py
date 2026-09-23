@@ -79,6 +79,7 @@ _SYSTEM_PROMPT_PRIVATE = """你是记忆系统的事件提取器，只输出严�
 7. keywords 是 2~5 个中文关键词，用于后续检索命中。
 8. 每个事件必须给 importance 整数 1~5。1=琐碎临时（纯闲聊、表情包、一次性玩笑、普通画图请求、单次无后续价值小事、重复性日常）；2=短期可能继续聊但长期价值低；3=普通可再提事件；4=重要决定、持续项目变化、明确状态变化或明显影响后续互动；5=极重要共同经历或长期关键事件。
 9. 高频重复日常行为（频繁画图、普通闲聊、表情包、问候）默认 importance=1；只有本次出现新的偏好、决定、冲突、显著情绪、新设定或持续影响未来互动的信息才提高。只评重要性，不决定永久保存。
+10. [person] 中的正式名字必须逐字复制，标题和正文必须一致；不得改成同音字、形近字或自行润色姓名。例如 [person=陆忱] 时只能写“陆忱”，绝不能写“陆澈”。
 
 【第一人称记事】
 - assistant（星星）在事件中：用"我"指代星星本人（例：我提议、我告诉陆忱……）
@@ -111,6 +112,7 @@ _SYSTEM_PROMPT_GROUP = """你是记忆系统的事件提取器，只输出严格
 8. keywords 是 2~5 个中文关键词，用于后续检索命中。
 9. 每个事件必须给 importance 整数 1~5。1=琐碎临时（纯闲聊、表情包、一次性玩笑、普通画图请求、重复性日常）；2=短期可能继续聊但长期价值低；3=普通可再提事件；4=重要决定、持续项目变化、明确状态变化或明显影响后续互动；5=极重要共同经历或长期关键事件。
 10. 高频重复日常行为（频繁画图、普通闲聊、表情包、问候）默认 importance=1；只有本次出现新的偏好、决定、冲突、显著情绪、新设定或持续影响未来互动的信息才提高。只评重要性，不决定永久保存。
+11. [person] 中的正式名字必须逐字复制，标题和正文必须一致；不得改成同音字、形近字或自行润色姓名。例如 [person=陆忱] 时只能写“陆忱”，绝不能写“陆澈”。
 
 【第一人称记事】
 - role=assistant（星星）参与的事件：用"我"指代星星本人
@@ -207,11 +209,54 @@ def _extract_first_json_object(text: str) -> str | None:
     return None
 
 
+_COMMON_CHINESE_SURNAMES = frozenset(
+    "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜戚谢"
+    "邹喻柏窦章云苏潘葛奚范彭郎鲁韦昌马苗方俞任袁柳鲍史唐费廉岑薛雷贺倪"
+    "汤滕殷罗毕郝邬安常乐于时傅皮卞齐康伍余元卜顾孟平黄穆萧尹姚邵湛汪"
+    "祁毛禹狄米贝臧计伏成戴谈宋茅庞熊纪舒屈项祝董梁杜阮蓝闵席季麻强贾"
+    "路娄危江童颜郭梅盛林刁钟徐邱骆高夏蔡田樊胡凌霍虞万柯管卢莫房裘缪"
+    "解应宗丁宣邓郁单杭洪包诸左石崔吉龚程嵇邢裴陆荣翁"
+)
+_NAME_FOLLOWERS = (
+    "说", "表示", "认为", "觉得", "决定", "想", "在", "和", "与", "把", "让", "问",
+    "回复", "提到", "完成", "发现", "支持", "计划", "建议", "希望", "需要", "今天",
+    "昨天", "中午", "晚上", "早上", "目前", "正在", "继续", "已经", "将", "要", "会",
+)
+
+
+def suspected_name_drift(title: str, content: str, canonical_names: set[str]) -> str | None:
+    """Find a conservative title/content typo such as 陆忱 -> 陆澈.
+
+    This intentionally only checks ordinary Chinese surname names already written
+    correctly in one field. It does not rewrite text, so ambiguous cases are sent
+    back to the model instead of silently changing a real person's name.
+    """
+    for name in canonical_names:
+        if not (2 <= len(name) <= 4 and name[0] in _COMMON_CHINESE_SURNAMES
+                and all("\u4e00" <= ch <= "\u9fff" for ch in name)):
+            continue
+        for reference, other in ((title, content), (content, title)):
+            if name not in reference or name in other:
+                continue
+            width = len(name)
+            for index in range(len(other) - width + 1):
+                candidate = other[index:index + width]
+                if (candidate[0] != name[0]
+                        or not all("\u4e00" <= ch <= "\u9fff" for ch in candidate)
+                        or sum(a != b for a, b in zip(candidate, name)) != 1):
+                    continue
+                following = other[index + width:index + width + 2]
+                if any(following.startswith(marker) for marker in _NAME_FOLLOWERS):
+                    return f"疑似人物名漂移：{candidate}（正式名字应为 {name}）"
+    return None
+
+
 def parse_llm_response(
     text: str,
     *,
     new_msg_ids: set[int],
     overlap_msg_ids: set[int],
+    canonical_names: set[str] | None = None,
 ) -> ExtractResult:
     """
     解析 LLM 返回的 JSON，应用硬规则校验。
@@ -275,6 +320,12 @@ def parse_llm_response(
 
         if not title or not content:
             logger.debug("[Memoir] event #%d rejected: empty title/content", i)
+            rejected += 1
+            continue
+
+        name_error = suspected_name_drift(title, content, canonical_names or set())
+        if name_error:
+            logger.debug("[Memoir] event #%d rejected: %s", i, name_error)
             rejected += 1
             continue
 
@@ -399,7 +450,8 @@ class EventExtractor:
         for attempt in range(2):
             try:
                 resp = await provider.text_chat(
-                    prompt=user_prompt if attempt == 0 else user_prompt + "\n上次输出有无效事件。请重新输出完整 JSON，确保每个事件都满足全部 raw_id 硬规则。",
+                    prompt=user_prompt if attempt == 0 else user_prompt +
+                    "\n上次输出有无效事件。请重新输出完整 JSON，满足全部 raw_id、人称和正式名字硬规则；[person] 姓名必须逐字复制。",
                     system_prompt=system_prompt,
                 )
             except Exception as e:
@@ -409,6 +461,7 @@ class EventExtractor:
             text = getattr(resp, "completion_text", None) or ""
             result = parse_llm_response(
                 text, new_msg_ids=new_msg_ids, overlap_msg_ids=overlap_msg_ids,
+                canonical_names={name for name, _ in identities.values()},
             )
             if result.success or not result.rejected_count:
                 break
