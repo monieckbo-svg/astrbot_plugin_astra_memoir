@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from astrbot.api import logger
 
 from ..storage import MemoirDB
-from .extractor import EventExtractor
+from .extractor import EventExtractor, calculate_memory_budget
 from .writer import EpisodeWriter, WriteBatchError
 
 
@@ -273,33 +273,45 @@ class BatchScheduler:
             )
         overlap_msgs = list(reversed(await self.db.run(_load_overlap)))
 
-        # 3. extractor
-        result = await self.extractor.extract(new_msgs, overlap_msgs, chat_type)
+        replied = {m["trigger_raw_id"] for m in new_msgs if m["role"] == "assistant"}
+        completed = sum(m["role"] == "user" and m["id"] in replied for m in new_msgs)
+        count = sum(m["role"] == "user" for m in new_msgs) if chat_type == "group" else len(new_msgs)
+        budget = calculate_memory_budget(chat_type, count, completed, mode == "idle")
+        run_id = await self.db.run(lambda: self.db.execute(
+            "INSERT INTO extraction_runs(session_id,source_chat_type,group_id,started_at,"
+            "new_raw_count,context_overlap_count,memory_budget,model) VALUES(?,?,?,?,?,?,?,?)",
+            (session_id,chat_type,group_id,int(time.time()),len(new_msgs),len(overlap_msgs),
+             budget,self.extractor.extract_provider_id or '当前主模型'),
+        ).lastrowid)
 
-        raw_ids = [int(m["id"]) for m in new_msgs]
+        async def failed(error, status='failed'):
+            # An already-committed write must not become a failure during vec repair/cancellation.
+            await self.db.run(lambda: self.db.execute(
+                "UPDATE extraction_runs SET status=?,error=?,completed_at=? "
+                "WHERE run_id=? AND status='running'",
+                (status,str(error)[:1000],int(time.time()),run_id)))
 
-        # 4. 分支处理
-        if not result.success:
-            logger.warning(
-                "[Memoir] extract failed for session=%s: %s — raw 保持 unprocessed，下次重试",
-                session_id, result.error,
-            )
-            return False  # 不 mark_processed
-
-        if not result.events:
-            # 合法的空结果 → 标 processed（防死循环）
-            logger.info(
-                "[Memoir] batch done: session=%s new=%d events=0 (nothing worth remembering)",
-                session_id, len(new_msgs),
-            )
-            processed_at = int(time.time())
-            await self.db.run(
-                lambda: self.db.mark_processed(raw_ids, processed_at)
-            )
-            return True
-
-        # 5. 有事件 → writer 原子写入
         try:
+            result = await self.extractor.extract(new_msgs, overlap_msgs, chat_type,
+                                                  memory_budget=budget, is_idle_flush=mode == 'idle')
+            await self.db.run(lambda: self.db.execute(
+                "UPDATE extraction_runs SET generated_count=?,skipped_importance1_count=?,"
+                "budget_trimmed_count=?,duplicate_count=?,discard_summary=?,"
+                "model=CASE WHEN ?='' THEN model ELSE ? END WHERE run_id=?",
+                (result.raw_event_count,result.skipped_importance1_count,result.budget_trimmed_count,
+                 result.duplicate_count,result.discard_summary,result.model,result.model,run_id)))
+            if not result.success:
+                await failed(result.error)
+                logger.warning("[Memoir] extraction run #%s failed: %s", run_id, result.error)
+                return False
+            raw_ids = [int(m['id']) for m in new_msgs]
+            if not result.events:
+                def _empty():
+                    with self.db.transaction():
+                        self.db.mark_processed(raw_ids, int(time.time()))
+                        self.db.finish_extraction_run(run_id, 0)
+                await self.db.run(_empty)
+                return True
             written = await self.writer.write_batch(
                 result.events,
                 raw_ids_to_mark=raw_ids,
@@ -307,6 +319,7 @@ class BatchScheduler:
                 chat_type=chat_type,
                 group_id=group_id,
                 platform=platform,
+                extraction_run_id=run_id,
             )
             logger.info(
                 "[Memoir] batch done: session=%s new=%d events=%d written=%d (rejected=%d)",
@@ -314,15 +327,12 @@ class BatchScheduler:
                 result.rejected_count,
             )
             return True
-        except WriteBatchError as e:
-            logger.error(
-                "[Memoir] write_batch failed: %s — raw 保持 unprocessed", e,
-            )
-            # 不 mark_processed
-        except Exception:
-            logger.exception(
-                "[Memoir] write_batch 异常 — raw 保持 unprocessed"
-            )
+        except asyncio.CancelledError:
+            await failed('提取任务已中断', 'interrupted')
+            raise
+        except Exception as exc:
+            await failed(exc)
+            logger.exception("[Memoir] extraction run #%s failed", run_id)
         return False
 
     # ---------- TTL ----------
@@ -331,6 +341,8 @@ class BatchScheduler:
         cutoff = int(time.time()) - self.config.raw_retention_days * 86400
 
         def _del():
+            self.db.execute("DELETE FROM extraction_runs WHERE completed_at < ? AND status != 'running'",
+                            (int(time.time()) - 30 * 86400,))
             return self.db.delete_expired_raw(cutoff)
 
         n = await self.db.run(_del)

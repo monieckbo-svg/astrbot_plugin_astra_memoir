@@ -102,6 +102,7 @@ class EpisodeWriter:
         chat_type: str,
         group_id: str | None,
         platform: str,
+        extraction_run_id: int | None = None,
     ) -> list[int]:
         """
         原子写入一整批事件 + 标 raw processed。
@@ -148,7 +149,12 @@ class EpisodeWriter:
         # importance=1 不进长期 episode，但整批 raw 仍在事务里标 processed。
         events = [ev for ev in events if ev.importance > 1]
         if not events:
-            await self.db.run(lambda: self.db.mark_processed(raw_ids_to_mark, int(time.time())))
+            def _empty():
+                with self.db.transaction():
+                    self.db.mark_processed(raw_ids_to_mark, int(time.time()))
+                    if extraction_run_id is not None:
+                        self.db.finish_extraction_run(extraction_run_id, 0)
+            await self.db.run(_empty)
             return []
 
         # 2. 批量生成 embedding（并发）
@@ -245,6 +251,8 @@ class EpisodeWriter:
                     accepted_embeddings.append(emb)
                 # 同一 transaction 里标 raw processed
                 self.db.mark_processed(raw_ids_to_mark, extracted_at)
+                if extraction_run_id is not None:
+                    self.db.finish_extraction_run(extraction_run_id, len(written))
             return written
 
         written = await self.db.run(_tx_write)

@@ -146,6 +146,10 @@ class MemoirDB:
 
         self._conn = conn
         conn.execute(
+            "UPDATE extraction_runs SET status='interrupted', completed_at=strftime('%s','now'), "
+            "error='插件重启时提取尚未完成' WHERE status='running'"
+        )
+        conn.execute(
             "UPDATE maintenance_runs SET status='failed', error=COALESCE(error,'插件重启时任务尚未完成') "
             "WHERE status='generating'"
         )
@@ -162,6 +166,14 @@ class MemoirDB:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+    def finish_extraction_run(self, run_id: int, stored_count: int) -> None:
+        """Called inside the same transaction as episode writes / raw processing."""
+        self.execute(
+            "UPDATE extraction_runs SET status='success',stored_count=?,"
+            "completed_at=strftime('%s','now') WHERE run_id=?",
+            (stored_count, run_id),
+        )
 
     # ---------- 同步操作（在 asyncio.to_thread 里调用） ----------
 

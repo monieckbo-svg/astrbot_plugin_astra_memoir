@@ -119,7 +119,21 @@ class MemoirPanel:
     async def get_stats(self) -> dict:
         def _q():
             now = int(time.time())
-            today_start = now - now % 86400
+            today_start = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+            raw_today = self.db.fetchone("SELECT COUNT(*) n FROM recent_messages WHERE created_at>=?", (today_start,))["n"]
+            extraction = dict(self.db.fetchone(
+                "SELECT COUNT(*) runs,COALESCE(SUM(generated_count),0) generated,"
+                "COALESCE(SUM(stored_count),0) stored,"
+                "COALESCE(SUM(CASE WHEN status='success' THEN new_raw_count ELSE 0 END),0) processed_raw,"
+                "COALESCE(SUM(budget_trimmed_count),0) trimmed,"
+                "COALESCE(SUM(budget_trimmed_count>0),0) trimmed_runs,"
+                "COALESCE(SUM(status IN ('failed','interrupted')),0) errors "
+                "FROM extraction_runs WHERE started_at>=?", (today_start,)))
+            importance_today = {str(r['importance']): r['n'] for r in self.db.fetchall(
+                "SELECT importance,COUNT(*) n FROM episodes WHERE extracted_at>=? GROUP BY importance", (today_start,))}
+            nightly = dict(self.db.fetchone(
+                "SELECT COALESCE(SUM(archive_count),0) archived,COALESCE(SUM(merge_result_count),0) merged "
+                "FROM maintenance_runs WHERE run_type='nightly' AND status='applied' AND applied_at>=?", (today_start,)))
             episodes_total = self.db.fetchone(
                 "SELECT COUNT(*) AS n FROM episodes"
             )["n"]
@@ -158,6 +172,11 @@ class MemoirPanel:
                 "GROUP BY session_id ORDER BY unprocessed_count DESC LIMIT 20"
             )
             return {
+                "raw_today": raw_today,
+                "extraction_today": extraction,
+                "episodes_per_100_raw": round(100 * extraction['stored'] / extraction['processed_raw'], 2) if extraction['processed_raw'] else None,
+                "importance_today": importance_today,
+                "nightly_today": nightly,
                 "episodes_total": episodes_total,
                 "episodes_archived": episodes_archived,
                 "episodes_active": episodes_active,
@@ -192,6 +211,23 @@ class MemoirPanel:
             except Exception as e:
                 logger.exception("[Memoir] vector repair failed")
                 return {"status": "error", "message": str(e)}
+
+    async def extraction_runs(self) -> dict:
+        try:
+            offset = max(0, int(_query('offset', 0)))
+            date = str(_query('date', '') or '')
+            params = []
+            where = ''
+            if date:
+                day = datetime.strptime(date, '%Y-%m-%d')
+                where = ' WHERE started_at>=? AND started_at<?'
+                params = [int(day.timestamp()), int((day+timedelta(days=1)).timestamp())]
+            rows = await self.db.run(lambda: self.db.fetchall(
+                'SELECT * FROM extraction_runs' + where + ' ORDER BY started_at DESC,run_id DESC LIMIT 21 OFFSET ?',
+                [*params, offset]))
+            return {'status': 'ok', 'data': [dict(r) for r in rows]}
+        except Exception as exc:
+            return {'status': 'error', 'message': str(exc)}
 
     # ---------- episodes list ----------
 
@@ -656,6 +692,10 @@ def register_panel_routes(context, panel: MemoirPanel):
     async def h_maintenance_apply(run_id: str): return await panel.maintenance_apply(run_id)
     async def h_maintenance_undo(run_id: str): return await panel.maintenance_undo(run_id)
     async def h_maintenance_delete(run_id: str): return await panel.maintenance_delete(run_id)
+    async def h_extraction_runs(): return await panel.extraction_runs()
+
+    context.register_web_api(f"{_ROUTE_PREFIX}/extraction/runs", h_extraction_runs,
+                             methods=["GET"], desc="Recent extraction audit (30 days)")
 
     context.register_web_api(
         f"{_ROUTE_PREFIX}/stats", h_stats, methods=["GET"],
@@ -713,4 +753,4 @@ def register_panel_routes(context, panel: MemoirPanel):
     context.register_web_api(f"{_ROUTE_PREFIX}/maintenance/runs/<run_id>/delete", h_maintenance_delete,
                              methods=["POST"], desc="Discard preview or delete failed run record")
 
-    logger.info("[Memoir] panel API endpoints registered (17 routes)")
+    logger.info("[Memoir] panel API endpoints registered (18 routes)")

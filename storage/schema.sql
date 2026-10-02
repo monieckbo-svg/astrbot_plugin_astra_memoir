@@ -1,4 +1,26 @@
 -- astrbot_plugin_astra_memoir Phase 1 schema
+-- Bounded extraction audit, independent of long-lived memory records.
+CREATE TABLE IF NOT EXISTS extraction_runs (
+    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    source_chat_type TEXT NOT NULL,
+    group_id TEXT,
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    new_raw_count INTEGER NOT NULL,
+    context_overlap_count INTEGER NOT NULL,
+    memory_budget INTEGER NOT NULL,
+    generated_count INTEGER NOT NULL DEFAULT 0,
+    stored_count INTEGER NOT NULL DEFAULT 0,
+    skipped_importance1_count INTEGER NOT NULL DEFAULT 0,
+    budget_trimmed_count INTEGER NOT NULL DEFAULT 0,
+    duplicate_count INTEGER NOT NULL DEFAULT 0,
+    model TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'running',
+    error TEXT,
+    discard_summary TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_extraction_runs_time ON extraction_runs(started_at, run_id);
 -- 参见 DESIGN.md 第 3 节
 --
 -- 注意：sqlite-vec 的 episode_vec 虚拟表在 vec_store.py 里创建

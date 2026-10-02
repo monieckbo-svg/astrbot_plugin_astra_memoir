@@ -24,6 +24,7 @@ from astrbot.api import logger
 from astrbot.api.star import Context
 
 from ..storage import MemoirDB
+from .embedding import _provider_id, provider_display_name
 
 
 # ============================================================
@@ -56,6 +57,63 @@ class ExtractResult:
     # 观测: 模型返回了 N 个 raw event，被硬规则过滤掉 M 个
     raw_event_count: int = 0
     rejected_count: int = 0
+    memory_budget: int = 0
+    skipped_importance1_count: int = 0
+    budget_trimmed_count: int = 0
+    duplicate_count: int = 0
+    discard_summary: str = ""
+    model: str = ""
+
+
+def calculate_memory_budget(source_chat_type: str, new_message_count: int,
+                            completed_user_turn_count: int = 0,
+                            is_idle_flush: bool = False) -> int:
+    """Group count means NEW inbound only; private count includes NEW replies."""
+    if new_message_count <= 0:
+        return 0
+    if source_chat_type == "group":
+        return 1 if new_message_count <= 10 else 2 if new_message_count <= 20 else 3 if new_message_count <= 40 else 4
+    if is_idle_flush and new_message_count <= 8:
+        return 1
+    return 3 if completed_user_turn_count > 10 or new_message_count > 24 else 2
+
+
+def enforce_memory_budget(result: ExtractResult, budget: int) -> ExtractResult:
+    """Apply after *all* events passed validation; never rescue invalid evidence."""
+    result.memory_budget = budget
+    if not result.success:
+        return result
+    result.skipped_importance1_count = sum(e.importance == 1 for e in result.events)
+    ranked = sorted((e for e in result.events if e.importance > 1),
+                    key=lambda e: (-e.importance, -len(set(e.source_raw_ids)), -len(e.content)))
+    unique, seen = [], set()
+    for event in ranked:
+        key = re.sub(r"\s+", "", event.content).casefold()
+        if key in seen:
+            result.duplicate_count += 1
+            continue
+        seen.add(key)
+        unique.append(event)
+    result.budget_trimmed_count = max(0, len(unique) - budget)
+    result.events = unique[:budget]
+    return result
+
+
+_VALUE_GATE = """
+【记忆门槛与预算】
+“发生过”不等于“值得成为长期 episode”。多数普通聊天批次应该产生 0~2 条记忆。
+输出前判断：三天、一周或一个月后重新提起这件事，是否仍有实际价值？没有就不写。
+可以记录：明确新偏好或偏好变化、决定、项目新阶段、配置变化、持续事务的新结果、
+人物身份/关系/状态变化、用户纠错、影响未来交互的新事实、独特经历、计划或承诺。
+通常不要记录：单次画图、表情包、一次性玩笑、即时反应、普通吃喝睡、群聊接话、
+固定重复行为、无新增信息的内容、已当场解决且无长期价值的报错、任务的每个小操作。
+同一项目短时间连续调参，只有形成有后续价值的新结果才形成事件，不逐步记流水账。
+宁可漏掉普通流水账，也不要为覆盖所有话题制造碎片。不同重要主题仍必须分开。
+用户提示中的 memory_budget 是严格上限，不是产量目标；events=[] 始终合法。
+importance=1 不进入正式记忆，只计入跳过统计。不要为绕过门槛提高 importance。
+JSON 顶层可附 discard_summary 字符串，简述未记录内容的类别与原因（最多300字），
+不要复制聊天原文，不要编造精确数量。没有可记内容时同样返回 events=[]。
+"""
 
 
 # ============================================================
@@ -70,7 +128,7 @@ _SYSTEM_PROMPT_PRIVATE = """你是记忆系统的事件提取器，只输出严�
 你的任务不是总结整段聊天，而是识别其中相互独立、未来可能被重新提及的事件。
 
 规则：
-1. 一批可以包含 0 到 N 个事件。不同主题必须拆开；只有确实属于同一件事的发展过程才合并。
+1. 一批可包含 0 到 memory_budget 个事件。不同主题必须拆开；只有确实属于同一件事的发展过程才合并。
 2. 不要为了减少数量把午饭、工作、宠物、画图等无关主题写进同一事件。
 3. 每个事件必须能脱离本批次独立理解，保留具体人、物、名称、数字、决定和结果。
 4. 不要生成"聊了生活"、"讨论了各种话题"这种空泛摘要。
@@ -102,7 +160,7 @@ _SYSTEM_PROMPT_GROUP = """你是记忆系统的事件提取器，只输出严格
 你的任务不是总结整段群聊，而是识别其中相互独立、未来可能被重新提及的事件。
 
 规则：
-1. 一批可以包含 0 到 N 个事件。不同主题必须拆开。
+1. 一批可包含 0 到 memory_budget 个事件。不同主题必须拆开。
 2. 群聊中即使 AI 助手完全没有参与，只要有值得记忆的信息（个人经历、观点、决定、事件），也应提取。
 3. 每条消息前的 [qq=XXX][person=正式名字][name=当时昵称][role=Z] 表明发言者身份；同一 QQ 是同一个人，不同人的言论必须严格区分。
 4. 每个事件必须能脱离本批次独立理解，保留具体人、物、名称、数字、决定和结果。
@@ -296,7 +354,8 @@ def parse_llm_response(
 
     # 合法的空结果
     if not raw_events:
-        return ExtractResult(success=True, events=[], raw_event_count=0)
+        return ExtractResult(success=True, events=[], raw_event_count=0,
+                             discard_summary=str(obj.get("discard_summary") or "")[:300])
 
     allowed = new_msg_ids | overlap_msg_ids
 
@@ -383,6 +442,7 @@ def parse_llm_response(
         events=valid,
         raw_event_count=len(raw_events),
         rejected_count=rejected,
+        discard_summary=str(obj.get("discard_summary") or "")[:300],
     )
 
 
@@ -419,12 +479,20 @@ class EventExtractor:
         new_msgs: list[sqlite3.Row],
         overlap_msgs: list[sqlite3.Row],
         chat_type: str,
+        *, memory_budget: int | None = None, is_idle_flush: bool = False,
     ) -> ExtractResult:
         """
         主入口。任何失败都会返回 success=False（scheduler 不会 mark_processed）。
         """
         if not new_msgs:
             return ExtractResult(success=True, events=[])
+
+        if memory_budget is None:
+            replied = {m["trigger_raw_id"] for m in new_msgs if m["role"] == "assistant"}
+            completed = sum(m["role"] == "user" and m["id"] in replied for m in new_msgs)
+            count = sum(m["role"] == "user" for m in new_msgs) if chat_type == "group" else len(new_msgs)
+            memory_budget = calculate_memory_budget(chat_type, count, completed, is_idle_flush)
+        memory_budget = max(0, min(memory_budget, 5 if chat_type == "group" else 4))
 
         provider = self._get_provider()
         if provider is None:
@@ -433,12 +501,14 @@ class EventExtractor:
             logger.error("[Memoir] %s，跳过本批", error)
             return ExtractResult(success=False, error=error)
 
-        system_prompt = _SYSTEM_PROMPT_GROUP if chat_type == "group" else _SYSTEM_PROMPT_PRIVATE
+        system_prompt = (_SYSTEM_PROMPT_GROUP if chat_type == "group" else _SYSTEM_PROMPT_PRIVATE) + _VALUE_GATE
+        model = provider_display_name(provider, _provider_id(provider) or self.extract_provider_id or type(provider).__name__)
         def _identity_map():
             ids = {str(m["speaker_id"]) for m in [*new_msgs, *overlap_msgs]}
             return {qq: self.db.identities.display(qq) for qq in ids}
         identities = await self.db.run(_identity_map)
         user_prompt = build_user_prompt(new_msgs, overlap_msgs, chat_type, identities)
+        user_prompt += f"\n<memory_budget>{memory_budget}</memory_budget>\n本批最多 {memory_budget} 条 episode，允许0条；overlap 不增加预算。"
         new_msg_ids = {int(m["id"]) for m in new_msgs}
         overlap_msg_ids = {int(m["id"]) for m in overlap_msgs}
 
@@ -456,7 +526,7 @@ class EventExtractor:
                 )
             except Exception as e:
                 logger.exception("[Memoir] LLM 事件提取调用失败: %s", e)
-                return ExtractResult(success=False, error=f"LLM call: {e}")
+                return ExtractResult(success=False, error=f"LLM call: {e}", model=model, memory_budget=memory_budget)
 
             text = getattr(resp, "completion_text", None) or ""
             result = parse_llm_response(
@@ -467,6 +537,7 @@ class EventExtractor:
                 break
 
         if result.success:
+            result = enforce_memory_budget(result, memory_budget)
             logger.info(
                 "[Memoir] extracted %d event(s) from %d new msg(s) (chat_type=%s, rejected=%d)",
                 len(result.events), len(new_msgs), chat_type, result.rejected_count,
@@ -476,4 +547,6 @@ class EventExtractor:
                 "[Memoir] extract FAILED: %s (raw_event_count=%d, rejected=%d)",
                 result.error, result.raw_event_count, result.rejected_count,
             )
+        result.memory_budget = memory_budget
+        result.model = model
         return result

@@ -260,7 +260,9 @@ async def main():
                 trigger_id = inserted_id
 
         # -------- 触发 process_batch --------
-        await scheduler.process_batch(priv_sess)
+        # Two completed turns reach this fixture's threshold; tiny idle batches
+        # intentionally have a one-event budget in production.
+        await scheduler.process_batch(priv_sess, mode="threshold")
 
         # 断言
         print()

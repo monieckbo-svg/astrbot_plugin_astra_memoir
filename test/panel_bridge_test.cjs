@@ -37,6 +37,10 @@ const bridge = {
     if (route === 'identities') return [{qq_id: '111', canonical_name: '陆忱',
       pronoun: 'TA', person_type: 'human', aliases: ['喵日天'], linked_qq_ids: []}];
     if (route === 'episodes/7') return episode;
+    if (route === 'extraction/runs') return [{run_id:1,started_at:1,source_chat_type:'group',
+      status:'success',new_raw_count:20,context_overlap_count:4,memory_budget:2,
+      generated_count:5,stored_count:2,skipped_importance1_count:1,budget_trimmed_count:2,
+      duplicate_count:0,model:'fixture',session_id:'g',discard_summary:'<script>不是原文</script>'}];
     if (route === 'raw') return [{id: 1, created_at: 1, chat_type: 'private',
       role: 'user', speaker_name: '甲', content: '原文'}];
     throw Error(route);
@@ -82,5 +86,8 @@ vm.runInNewContext(script, sandbox);
   await sandbox.repairVectors();
   assert.match(element('repairResult').textContent, /补齐 0 条/);
   assert.deepEqual(calls.slice(0, 6), ['stats', 'stats', 'episodes', 'identities', 'episodes/7', 'raw']);
+  await sandbox.loadExtractionRuns();
+  assert.match(element('extractionRuns').innerHTML, /预算 2 · 生成 5 · 写入 2/);
+  assert.match(element('extractionRuns').innerHTML, /&lt;script&gt;/);
   console.log('Panel bridge unwrapped data test passed');
 })().catch(err => { console.error(err); process.exitCode = 1; });

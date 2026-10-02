@@ -144,6 +144,7 @@
     <button data-tab="trash">回收站</button>
     <button data-tab="maintenance">每日整理记录</button>
     <button data-tab="identities">人物身份</button>
+    <button data-tab="extraction">提取记录</button>
     <button data-tab="raw">近期原文</button>
     <button data-tab="debug">检索调试</button>
   </nav>
@@ -181,6 +182,12 @@
     <div class="card">归档内容不参与普通自动召回，但仍可查看、编辑、恢复或移入回收站。</div>
     <div class="toolbar"><label>日期 <input type="date" id="archiveDate"></label><button onclick="loadStateEpisodes('archived',true)">筛选</button><button onclick="clearEpisodeDate('archived')">全部日期</button></div>
     <div id="archiveList"><div class="loading">加载中…</div></div>
+  </div>
+
+  <div id="extraction" class="tab-content" hidden>
+    <div class="card">最近30天提取记录。预算是上限，生成0条也是正常成功。未记录原因由模型提供，仅供核对；原文仍按原有保留期管理。</div>
+    <div class="toolbar"><label>日期（服务器时区） <input type="date" id="extractionDate"></label><button onclick="loadExtractionRuns(1)">筛选 / 刷新</button></div>
+    <div id="extractionRuns"></div>
   </div>
 
   <div id="trash" class="tab-content" hidden>
@@ -323,6 +330,7 @@ function showTab(name) {
   if (name === 'maintenance') loadMaintenanceRuns();
   if (name === 'identities') loadIdentities();
   if (name === 'raw') loadRaw();
+  if (name === 'extraction') loadExtractionRuns(1);
 }
 document.querySelectorAll('nav button').forEach(b => {
   b.onclick = () => showTab(b.dataset.tab);
@@ -428,6 +436,14 @@ async function loadStats() {
       ['归档池', d.episodes_archived ?? 0],
       ['回收站', d.episodes_trashed ?? 0],
       ['今日新增', d.episodes_today],
+      ['今日原文', d.raw_today ?? 0],
+      ['今日提取次数', d.extraction_today?.runs ?? 0],
+      ['今日模型生成 / 实际写入', `${d.extraction_today?.generated ?? 0} / ${d.extraction_today?.stored ?? 0}`],
+      ['每100条处理原文写入记忆（今日成功批次）', d.episodes_per_100_raw ?? '暂无数据'],
+      ['今日重要性分布（1→5）', [1,2,3,4,5].map(i => `${i}: ${d.importance_today?.[i] ?? 0}`).join(' / ')],
+      ['今日夜间归档 / 合并产出', `${d.nightly_today?.archived ?? 0} / ${d.nightly_today?.merged ?? 0}`],
+      ['今日超预算批次 / 裁剪条数', `${d.extraction_today?.trimmed_runs ?? 0} / ${d.extraction_today?.trimmed ?? 0}`],
+      ['今日提取错误', d.extraction_today?.errors ?? 0],
       ['Raw 总数', d.raw_total],
       ['Raw 未处理', d.raw_unprocessed],
       ['缺失向量', d.vec_missing],
@@ -752,6 +768,23 @@ async function runDebugRecall() {
 }
 
 // ============ Maintenance ============
+async function loadExtractionRuns(page=1) {
+  const wrap = document.getElementById('extractionRuns');
+  wrap.innerHTML = '<div class="loading">加载中…</div>';
+  try {
+    const rows = await api('extraction/runs', {date: document.getElementById('extractionDate').value, offset: (page-1)*20});
+    const labels = {running:'提取中', success:'成功', failed:'失败', interrupted:'已中断'};
+    wrap.innerHTML = rows.slice(0,20).map(r => `<div class="card">
+      <b>#${r.run_id} · ${escapeHtml(new Date(r.started_at*1000).toLocaleString())} · ${r.source_chat_type==='group'?'群聊':'私聊'} · ${escapeHtml(labels[r.status] || r.status)}</b>
+      <p>新消息 ${r.new_raw_count} · 上下文 ${r.context_overlap_count} · 预算 ${r.memory_budget} · 生成 ${r.generated_count} · 写入 ${r.stored_count}</p>
+      <p>低价值跳过 ${r.skipped_importance1_count} · 预算裁剪 ${r.budget_trimmed_count} · 批内去重 ${r.duplicate_count}</p>
+      <div class="ep-meta">${escapeHtml(r.model)} · ${escapeHtml(r.session_id)}</div>
+      <div>${escapeHtml(r.discard_summary || '模型未提供未记录原因')}</div>
+      ${r.error ? `<div class="error">${escapeHtml(r.error)}</div>` : ''}</div>`).join('') || '<div class="empty">没有提取记录</div>';
+    wrap.innerHTML += `<div class="toolbar"><button ${page===1?'disabled':''} onclick="loadExtractionRuns(${page-1})">上一页</button><span>第 ${page} 页</span><button ${rows.length<=20?'disabled':''} onclick="loadExtractionRuns(${page+1})">下一页</button></div>`;
+  } catch(e) { wrap.innerHTML = `<div class="error">${escapeHtml(e.message)}</div>`; }
+}
+
 async function previewMaintenance() {
   const result = document.getElementById('maintResult');
   const start_date = document.getElementById('maintStart').value;
