@@ -16,7 +16,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-import sqlite_vec
+try:
+    import sqlite_vec
+except ImportError:
+    sqlite_vec = None
 from .identity import IdentityStore
 
 # schema.sql 相对于本文件的位置
@@ -41,10 +44,12 @@ class MemoirDB:
         self._conn: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()  # 用于并发写入的粗粒度保护
         self.identities = IdentityStore(self)
+        self.vector_ready = False
+        self.vector_error = None
 
     # ---------- 初始化 ----------
 
-    def initialize(self) -> None:
+    def initialize(self, *, defer_vectors: bool = False) -> None:
         """
         建库、加载 sqlite-vec 扩展、执行 schema.sql、创建 vec 虚拟表。
         幂等：重复调用不会破坏已有数据。
@@ -65,9 +70,19 @@ class MemoirDB:
         conn.execute("PRAGMA busy_timeout = 5000")
 
         # 加载 sqlite-vec 扩展
-        conn.enable_load_extension(True)
-        sqlite_vec.load(conn)
-        conn.enable_load_extension(False)
+        try:
+            conn.enable_load_extension(True)
+            if sqlite_vec is None:
+                raise RuntimeError('sqlite-vec 未安装')
+            sqlite_vec.load(conn)
+        except Exception as exc:
+            self.vector_error = str(exc)
+            if not defer_vectors:
+                conn.close()
+                raise
+        finally:
+            if defer_vectors or not self.vector_error:
+                conn.enable_load_extension(False)
 
         # 执行 schema.sql（普通表 + FTS5 + meta）
         schema_sql = _SCHEMA_SQL_PATH.read_text(encoding="utf-8")
@@ -112,39 +127,13 @@ class MemoirDB:
                     f"ALTER TABLE maintenance_runs ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
                 )
 
-        previous = dict(conn.execute("SELECT key, value FROM meta WHERE key IN ('embedding_dim', 'embedding_provider_id')").fetchall())
-        vec_exists = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'episode_vec'").fetchone() is not None
-        # 旧版本没有 provider 元信息时必须重建，避免混用不同模型的向量。
-        changed = vec_exists and (
-            previous.get("embedding_dim") != str(self.embedding_dim)
-            or previous.get("embedding_provider_id") != self.embedding_provider_id
-            or "is_archived" not in {row["name"] for row in conn.execute("PRAGMA table_info(episode_vec)")}
-        )
-        if changed:
-            conn.execute("DROP TABLE episode_vec")
-
-        # 创建 vec0 虚拟表（含 metadata 列用于 KNN 阶段可见性过滤）
-        # sqlite-vec v0.1.6+ 支持 metadata columns
-        conn.execute(
-            f"""
-            CREATE VIRTUAL TABLE IF NOT EXISTS episode_vec USING vec0(
-                episode_id  INTEGER PRIMARY KEY,
-                chat_type   TEXT,
-                session_id  TEXT,
-                group_id    TEXT,
-                is_archived INTEGER,
-                embedding   FLOAT[{self.embedding_dim}] distance_metric=cosine
-            )
-            """
-        )
-
-        conn.executemany(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
-            [("embedding_dim", str(self.embedding_dim)),
-             ("embedding_provider_id", self.embedding_provider_id)],
-        )
-
         self._conn = conn
+        if defer_vectors:
+            self.embedding_dim = int(self.get_meta('embedding_dim') or 0)
+            self.vector_ready = not self.vector_error and bool(conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='episode_vec'").fetchone())
+        else:
+            self.configure_vectors(self.embedding_dim, self.embedding_provider_id)
         conn.execute(
             "UPDATE extraction_runs SET status='interrupted', completed_at=strftime('%s','now'), "
             "error='插件重启时提取尚未完成' WHERE status='running'"
@@ -161,6 +150,35 @@ class MemoirDB:
             self.identities.backfill()
             self.set_meta("identity_backfill_done", "1")
         self.identities.remove_canonical_aliases()
+
+    def configure_vectors(self, dim: int, provider_id: str) -> None:
+        """Called only after a provider probe succeeded; temporary outages preserve the index."""
+        if dim <= 0:
+            raise ValueError('无效向量维度')
+        if self.vector_error:
+            self.conn.enable_load_extension(True)
+            try:
+                if sqlite_vec is None:
+                    raise RuntimeError('sqlite-vec 未安装')
+                sqlite_vec.load(self.conn)
+                self.vector_error = None
+            finally:
+                self.conn.enable_load_extension(False)
+        exists = self.fetchone("SELECT 1 FROM sqlite_master WHERE name='episode_vec'")
+        changed = exists and (self.get_meta('embedding_dim') != str(dim)
+            or self.get_meta('embedding_provider_id') != provider_id
+            or 'is_archived' not in {r['name'] for r in self.fetchall('PRAGMA table_info(episode_vec)')})
+        with self.transaction():
+            if changed:
+                self.execute('DROP TABLE episode_vec')
+            self.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS episode_vec USING vec0("
+                         f"episode_id INTEGER PRIMARY KEY,chat_type TEXT,session_id TEXT,group_id TEXT,"
+                         f"is_archived INTEGER,embedding FLOAT[{int(dim)}] distance_metric=cosine)")
+            self.set_meta('embedding_dim', str(dim))
+            self.set_meta('embedding_provider_id', provider_id)
+        self.embedding_dim = dim
+        self.embedding_provider_id = provider_id
+        self.vector_ready = True
 
     def close(self) -> None:
         if self._conn is not None:
@@ -223,7 +241,16 @@ class MemoirDB:
         per-session lock 在 scheduler 层管，DB 层再上一道保险。
         """
         async with self._lock:
-            return await asyncio.to_thread(func, *args, **kwargs)
+            work = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+            try:
+                return await asyncio.shield(work)
+            except asyncio.CancelledError:
+                # Cancelling asyncio does not stop a SQLite worker thread. Keep
+                # the connection lock until it finishes before reload closes DB.
+                try:
+                    await work
+                finally:
+                    raise
 
     # ---------- 常用查询封装 ----------
 
@@ -506,7 +533,8 @@ class MemoirDB:
                 batch = ids[start:start + 500]
                 placeholders = ",".join("?" * len(batch))
                 self.execute(f"UPDATE episodes SET is_archived=1,status='archived',archive_reason='短期记忆自然过期' WHERE id IN ({placeholders})", batch)
-                self.execute(f"UPDATE episode_vec SET is_archived = 1 WHERE episode_id IN ({placeholders})", batch)
+                if self.vector_ready:
+                    self.execute(f"UPDATE episode_vec SET is_archived = 1 WHERE episode_id IN ({placeholders})", batch)
             return len(ids)
 
     def insert_participants(

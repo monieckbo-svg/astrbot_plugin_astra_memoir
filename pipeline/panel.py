@@ -117,6 +117,7 @@ class MemoirPanel:
     # ---------- stats ----------
 
     async def get_stats(self) -> dict:
+        health = self.health.watchdog() if hasattr(self, 'health') else {}
         def _q():
             now = int(time.time())
             today_start = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
@@ -159,19 +160,30 @@ class MemoirPanel:
             missing_vec = self.db.fetchone(
                 "SELECT COUNT(*) AS n FROM episodes e LEFT JOIN episode_vec v "
                 "ON v.episode_id = e.id WHERE v.episode_id IS NULL AND e.status != 'trashed'"
-            )["n"]
+            )["n"] if self.db.vector_ready else self.db.fetchone(
+                "SELECT COUNT(*) n FROM episodes WHERE status != 'trashed'")["n"]
             vector_eligible = self.db.fetchone(
                 "SELECT COUNT(*) AS n FROM episodes WHERE status != 'trashed'"
             )["n"]
             last_extracted = self.db.fetchone(
-                "SELECT MAX(extracted_at) AS t FROM episodes"
+                "SELECT MAX(completed_at) AS t FROM extraction_runs WHERE status='success' "
+                "AND generated_count-skipped_importance1_count-budget_trimmed_count-duplicate_count>0"
             )["t"]
+            last_attempt = self.db.fetchone('SELECT MAX(started_at) t FROM extraction_runs')['t']
+            last_write = self.db.fetchone('SELECT MAX(extracted_at) t FROM episodes')['t']
+            latest_run = self.db.fetchone('SELECT status FROM extraction_runs ORDER BY run_id DESC LIMIT 1')
             sessions_active = self.db.fetchall(
                 "SELECT session_id, chat_type, group_id, COUNT(*) AS unprocessed_count "
                 "FROM recent_messages WHERE processed_at IS NULL "
                 "GROUP BY session_id ORDER BY unprocessed_count DESC LIMIT 20"
             )
             return {
+                "health": {**health, 'last_extraction_attempt_at': last_attempt,
+                           'last_nonempty_extraction_at': last_extracted,
+                           'last_episode_written_at': last_write},
+                "raw_ingestion_status": health.get('ingestion_status', 'unknown'),
+                "extractor_status": latest_run['status'] if latest_run else 'waiting',
+                "vector_index_status": ('degraded' if not self.db.vector_ready else 'missing' if missing_vec else 'ok'),
                 "raw_today": raw_today,
                 "extraction_today": extraction,
                 "episodes_per_100_raw": round(100 * extraction['stored'] / extraction['processed_raw'], 2) if extraction['processed_raw'] else None,
@@ -190,10 +202,10 @@ class MemoirPanel:
                 "embedding_provider_name": provider_display_name(
                     self.embedding_provider, self.embedding_provider_id
                 ),
-                "embedding_dim": self.embedding_dim,
-                "embedding_status": "ok",
+                "embedding_dim": self.db.embedding_dim,
+                "embedding_status": health.get('embedding_status', 'unknown'),
                 "last_extracted_at": last_extracted,
-                "scheduler_running": self.scheduler._main_task is not None,
+                "scheduler_running": self.scheduler._main_task is not None and not self.scheduler._main_task.done(),
                 "active_sessions": [_row_to_dict(r) for r in sessions_active],
             }
 
@@ -201,7 +213,11 @@ class MemoirPanel:
             return {"status": "ok", "data": await self.db.run(_q)}
         except Exception as e:
             logger.exception("[Memoir] get_stats 异常")
-            return {"status": "error", "message": str(e), "data": {}}
+            if hasattr(self, 'health'):
+                self.health.error('database', e)
+            return {"status": "ok", "data": {"health": {**health, 'database_error': str(e)},
+                    "raw_ingestion_status": 'error', 'embedding_status': health.get('embedding_status','unknown'),
+                    "extractor_status": 'unknown', 'vector_index_status': 'unknown', 'scheduler_running': False}}
 
     async def repair_vectors(self) -> dict:
         async with self._repair_lock:
@@ -226,6 +242,41 @@ class MemoirPanel:
                 'SELECT * FROM extraction_runs' + where + ' ORDER BY started_at DESC,run_id DESC LIMIT 21 OFFSET ?',
                 [*params, offset]))
             return {'status': 'ok', 'data': [dict(r) for r in rows]}
+        except Exception as exc:
+            return {'status': 'error', 'message': str(exc)}
+
+    async def inspect_history(self) -> dict:
+        """Read only; LLM history is not automatically promoted to platform evidence."""
+        try:
+            session = str(_query('session_id', '') or '').strip()
+            platform = str(_query('platform_id', '') or '').strip()
+            page = max(1, int(_query('page', 1)))
+            if not session:
+                raise ValueError('请输入真实session_id（从近期原文技术信息复制）')
+            context = getattr(self, 'context', None)
+            result = {'platform_history': [], 'conversation_entries': None,
+                      'notes': ['只读检查，不会补造或自动导入消息；检查其他页或旧会话以确认覆盖范围。']}
+            manager = getattr(context, 'message_history_manager', None)
+            if manager is not None and platform:
+                rows = await asyncio.wait_for(manager.get(platform_id=platform, user_id=session,
+                                                         page=page, page_size=100), 15)
+                result['platform_history'] = [dict(
+                    history_id=getattr(r, 'id', None),
+                    created_at=str(getattr(r, 'created_at', '') or ''),
+                    sender_id=getattr(r, 'sender_id', None),
+                    sender_name=getattr(r, 'sender_name', None),
+                    content=getattr(r, 'content', None)) for r in rows]
+            else:
+                result['notes'].append('平台历史接口不可用或未填写平台实例ID；不能据此断定平台没有聊天。')
+            conversations = getattr(context, 'conversation_manager', None)
+            if conversations is not None:
+                cid = await asyncio.wait_for(conversations.get_curr_conversation_id(session), 15)
+                if cid:
+                    conv = await asyncio.wait_for(conversations.get_conversation(session, cid), 15)
+                    history = json.loads(getattr(conv, 'history', '[]') or '[]')
+                    result['conversation_entries'] = len(history)
+                    result['notes'].append('当前LLM会话存在；不保证含原始消息ID、时间或全部群消息，不能直接作为完整raw补录。')
+            return {'status': 'ok', 'data': result}
         except Exception as exc:
             return {'status': 'error', 'message': str(exc)}
 
@@ -423,7 +474,7 @@ class MemoirPanel:
 
             vec_row = self.db.fetchone(
                 "SELECT episode_id FROM episode_vec WHERE episode_id = ?", (eid,)
-            )
+            ) if self.db.vector_ready else None
             ep_dict["vec_present"] = vec_row is not None
             ep_dict["versions"] = [_row_to_dict(v) for v in self.db.fetchall(
                 "SELECT * FROM episode_versions WHERE episode_id=? ORDER BY id DESC", (eid,))]
@@ -693,6 +744,10 @@ def register_panel_routes(context, panel: MemoirPanel):
     async def h_maintenance_undo(run_id: str): return await panel.maintenance_undo(run_id)
     async def h_maintenance_delete(run_id: str): return await panel.maintenance_delete(run_id)
     async def h_extraction_runs(): return await panel.extraction_runs()
+    async def h_inspect_history(): return await panel.inspect_history()
+
+    context.register_web_api(f"{_ROUTE_PREFIX}/diagnostics/history", h_inspect_history,
+                             methods=["GET"], desc="Read-only AstrBot history inspection")
 
     context.register_web_api(f"{_ROUTE_PREFIX}/extraction/runs", h_extraction_runs,
                              methods=["GET"], desc="Recent extraction audit (30 days)")
@@ -753,4 +808,4 @@ def register_panel_routes(context, panel: MemoirPanel):
     context.register_web_api(f"{_ROUTE_PREFIX}/maintenance/runs/<run_id>/delete", h_maintenance_delete,
                              methods=["POST"], desc="Discard preview or delete failed run record")
 
-    logger.info("[Memoir] panel API endpoints registered (18 routes)")
+    logger.info("[Memoir] panel API endpoints registered (19 routes)")

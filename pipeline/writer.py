@@ -20,6 +20,7 @@ from __future__ import annotations
 import time
 import math
 import struct
+import asyncio
 from datetime import datetime, timezone
 
 from astrbot.api import logger
@@ -45,6 +46,7 @@ class EpisodeWriter:
         self.embedding_provider = embedding_provider
         self.db = db
         self.vec = vec
+        self._repair_lock = asyncio.Lock()
 
     # ---------- Embedding ----------
 
@@ -58,34 +60,47 @@ class EpisodeWriter:
             logger.exception("[Memoir] embedding 生成失败")
             return None
 
-    async def reindex_missing_vectors(self, batch_size: int = 50) -> dict:
+    async def reindex_missing_vectors(self, batch_size: int = 50, max_episodes: int | None = None) -> dict:
+        async with self._repair_lock:
+            return await self._repair_vectors(batch_size, max_episodes)
+
+    async def _repair_vectors(self, batch_size, max_episodes):
         """Repair missing vectors in bounded pages; preserve episodes on failures."""
         repaired = failed = 0
+        if not self.db.vector_ready:
+            return {'repaired': 0, 'failed': 0, 'deferred': True}
         last_id = 0
         while True:
             def _load():
                 return self.db.fetchall(
                     "SELECT e.id, e.title, e.content, e.chat_type, e.session_id, e.group_id, e.is_archived "
                     "FROM episodes e LEFT JOIN episode_vec v ON v.episode_id = e.id "
-                    "WHERE v.episode_id IS NULL AND e.id > ? ORDER BY e.id LIMIT ?",
+                    "WHERE v.episode_id IS NULL AND e.status != 'trashed' AND e.id > ? ORDER BY e.id LIMIT ?",
                     (last_id, batch_size),
                 )
             rows = await self.db.run(_load)
             if not rows:
                 break
             for row in rows:
+                if max_episodes is not None and repaired + failed >= max_episodes:
+                    return {'repaired': repaired, 'failed': failed}
                 last_id = row["id"]
                 embedding = await self._embed(f"{row['title']}\n{row['content']}")
                 if embedding is None:
                     failed += 1
-                    continue
+                    return {'repaired': repaired, 'failed': failed}
                 try:
-                    await self.db.run(lambda row=row, embedding=embedding: self.vec.upsert(
-                        row["id"], embedding, chat_type=row["chat_type"],
-                        session_id=row["session_id"], group_id=row["group_id"],
-                        is_archived=row["is_archived"],
-                    ))
-                    repaired += 1
+                    def _save():
+                        current = self.db.fetchone('SELECT * FROM episodes WHERE id=?', (row['id'],))
+                        if (not current or current['status'] == 'trashed'
+                                or current['title'] != row['title'] or current['content'] != row['content']
+                                or self.db.fetchone('SELECT 1 FROM episode_vec WHERE episode_id=?', (row['id'],))):
+                            return 0
+                        self.vec.upsert(row['id'], embedding, chat_type=current['chat_type'],
+                                        session_id=current['session_id'], group_id=current['group_id'],
+                                        is_archived=current['is_archived'])
+                        return 1
+                    repaired += await self.db.run(_save)
                 except Exception:
                     logger.exception("[Memoir] vector repair failed for episode %d", row["id"])
                     failed += 1
@@ -164,13 +179,7 @@ class EpisodeWriter:
         ]
         embeddings = await asyncio.gather(*embed_tasks, return_exceptions=False)
 
-        # 至少一个失败 → 不落库（避免半推半就的批次）
-        # V1 保守：全部成功才落
-        if any(e is None for e in embeddings):
-            failed_idx = [i for i, e in enumerate(embeddings) if e is None]
-            raise WriteBatchError(
-                f"embedding failed for event indices: {failed_idx}"
-            )
+        # SQLite is truth: unavailable embeddings leave repairable missing vectors.
 
         # 3. 单 transaction: episodes + participants + keywords + FTS + mark_processed
         extracted_at = int(time.time())
@@ -198,7 +207,7 @@ class EpisodeWriter:
             accepted_embeddings: list[list[float]] = []
             with self.db.transaction():
                 for index, (ev, pp, emb) in enumerate(zip(events, prepared, embeddings)):
-                    packed = struct.pack(f"{len(emb)}f", *emb)
+                    packed = struct.pack(f"{len(emb)}f", *emb) if emb is not None else None
                     duplicate = self.db.fetchone(
                         "SELECT e.id FROM episodes e JOIN episode_vec v ON v.episode_id = e.id "
                         "WHERE e.session_id = ? AND e.status != 'trashed' "
@@ -208,7 +217,7 @@ class EpisodeWriter:
                         "AND vec_distance_cosine(v.embedding, ?) <= 0.025 "
                         "ORDER BY e.id DESC LIMIT 1",
                         (session_id, packed),
-                    )
+                    ) if packed is not None and self.db.vector_ready else None
                     if duplicate:
                         # 新事件和旧事件高度相同，视为再次提及；不是因误召回而强化。
                         self.db.execute(
@@ -224,7 +233,7 @@ class EpisodeWriter:
                         )
                         logger.info("[Memoir] repeated episode reinforced: %s", ev.title)
                         continue
-                    if any(
+                    if emb is not None and any(
                         1 - sum(a*b for a, b in zip(emb, old)) /
                         (math.sqrt(sum(a*a for a in emb) * sum(b*b for b in old)) or 1) <= 0.025
                         for old in accepted_embeddings
@@ -248,7 +257,8 @@ class EpisodeWriter:
                     self.db.insert_keywords(eid, ev.keywords)
                     self.db.insert_fts(eid, ev.title, ev.content, ev.keywords)
                     written.append((eid, index))
-                    accepted_embeddings.append(emb)
+                    if emb is not None:
+                        accepted_embeddings.append(emb)
                 # 同一 transaction 里标 raw processed
                 self.db.mark_processed(raw_ids_to_mark, extracted_at)
                 if extraction_run_id is not None:
@@ -261,6 +271,8 @@ class EpisodeWriter:
         # 4. transaction 外写 vec —— 失败不删 episode
         for eid, index in written:
             emb = embeddings[index]
+            if emb is None or not self.db.vector_ready:
+                continue
             def _vec_upsert(eid=eid, emb=emb):
                 self.vec.upsert(
                     eid, emb,

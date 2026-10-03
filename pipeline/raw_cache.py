@@ -31,9 +31,21 @@ class RawCache:
     所有 DB 操作通过 asyncio.to_thread 走线程池，不阻塞事件循环。
     """
 
-    def __init__(self, db: MemoirDB, bot_display_name: str = "星星"):
+    def __init__(self, db: MemoirDB, bot_display_name: str = "星星", health=None):
         self.db = db
         self.bot_display_name = bot_display_name
+        self.health = health
+
+    def _observed(self, row_id, event):
+        if not self.health:
+            return
+        if row_id is None:
+            self.health.update(last_raw_skip_reason='重复消息', raw_pending_since=0)
+        else:
+            now = int(time.time())
+            key = 'last_group_raw_at' if event.get_group_id() else 'last_private_raw_at'
+            self.health.update(last_raw_ingest_at=now, **{key: now}, raw_error=None,
+                               raw_pending_since=0, last_raw_skip_reason=None)
 
     # ---------- Helpers ----------
 
@@ -64,14 +76,20 @@ class RawCache:
         返回：新行 id；已存在（dedupe 命中）返回 None；异常返回 None 并日志。
         """
         try:
+            if self.health:
+                self.health.update(last_message_hook_seen_at=int(time.time()))
             content = event.get_message_str()
             if not content or not content.strip():
                 # 纯图片/表情/命令等 —— 也可以先记，但 V1 先跳过无字消息避免噪声
+                if self.health:
+                    self.health.update(last_raw_skip_reason='无文本消息，按现有规则跳过')
                 return None
 
             session_id = event.unified_msg_origin
             platform_message_id = self._get_platform_message_id(event)
             if not platform_message_id:
+                if self.health:
+                    self.health.error('raw', '收到文本消息但缺少平台消息ID，无法安全入库')
                 logger.debug("[Memoir] user msg has no platform_message_id, skip")
                 return None
 
@@ -80,6 +98,8 @@ class RawCache:
             group_id = event.get_group_id() or None
 
             key = user_dedupe_key(session_id, platform_message_id)
+            if self.health and not self.health.data.get('raw_pending_since'):
+                self.health.update(raw_pending_since=int(time.time()))
 
             def _insert():
                 # 即使 Astra 尚未产生可缓存的回复，也先建自己的身份卡。
@@ -100,8 +120,12 @@ class RawCache:
                     created_at=int(time.time()),
                 )
 
-            return await self.db.run(_insert)
-        except Exception:
+            row_id = await self.db.run(_insert)
+            self._observed(row_id, event)
+            return row_id
+        except Exception as exc:
+            if self.health:
+                self.health.error('raw', exc)
             logger.exception("[Memoir] record_user_message 失败")
             return None
 
@@ -125,6 +149,8 @@ class RawCache:
             session_id = event.unified_msg_origin
             trigger_platform_msg_id = self._get_platform_message_id(event)
             if not trigger_platform_msg_id:
+                if self.health:
+                    self.health.error('raw', 'LLM回复缺少触发消息ID')
                 logger.warning(
                     "[Memoir] on_llm_response: event has no platform_message_id, "
                     "skip assistant raw write (session=%s)",
@@ -138,6 +164,8 @@ class RawCache:
 
             trigger_row = await self.db.run(_find_trigger)
             if trigger_row is None:
+                if self.health:
+                    self.health.error('raw', 'LLM回复找不到触发用户原文，可能user hook漏采')
                 logger.warning(
                     "[Memoir] on_llm_response: trigger user raw not found "
                     "(session=%s, msg_id=%s), skip assistant write",
@@ -168,7 +196,11 @@ class RawCache:
                     created_at=int(time.time()),
                 )
 
-            return await self.db.run(_insert)
-        except Exception:
+            row_id = await self.db.run(_insert)
+            self._observed(row_id, event)
+            return row_id
+        except Exception as exc:
+            if self.health:
+                self.health.error('raw', exc)
             logger.exception("[Memoir] record_assistant_reply 失败")
             return None

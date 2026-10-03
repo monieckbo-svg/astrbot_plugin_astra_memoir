@@ -153,6 +153,12 @@
 <main>
   <div id="stats" class="tab-content">
     <div class="stats-grid" id="statsGrid"><div class="loading">加载中…</div></div>
+    <div id="healthDetails"></div>
+    <details class="card"><summary>检查 AstrBot 历史（只读）</summary>
+      <p>填入真实会话标识和平台实例ID，核对缺失时间段。LLM会话记录可能没有完整发言者、时间或原消息ID，不会自动补入raw。</p>
+      <div class="toolbar"><input id="historySession" placeholder="session_id"><input id="historyPlatform" placeholder="平台实例ID"><input id="historyPage" type="number" min="1" value="1" style="width:80px"><button onclick="inspectHistory()">检查</button></div>
+      <pre id="historyInspection"></pre>
+    </details>
     <div class="card"><button onclick="repairVectors()">补齐缺失向量</button><span id="repairResult" style="margin-left:10px"></span></div>
     <div class="card">
       <div style="font-weight:600;margin-bottom:8px">活跃 session（有未处理消息）</div>
@@ -429,6 +435,10 @@ async function loadStats() {
   grid.innerHTML = '<div class="loading">加载中…</div>';
   try {
     const d = await api('stats');
+    const statusLabel = value => ({ok:'正常',degraded:'降级 / 等待恢复',missing:'有缺失向量',
+      unknown:'无法确认',waiting:'等待首次记录',observed:'近期hook有活动',stalled:'采集停滞报警',
+      error:'异常',failed:'最近提取失败',interrupted:'最近提取中断',success:'最近提取成功',
+      running:'正在提取',stopped:'已停止'}[value] || value || '无法确认');
     const active = d.episodes_active ?? Math.max(0, (d.episodes_total || 0) - (d.episodes_archived || 0) - (d.episodes_trashed || 0));
     const vectorEligible = Math.max(0, (d.episodes_total || 0) - (d.episodes_trashed || 0));
     const items = [
@@ -451,7 +461,10 @@ async function loadStats() {
       ['Embedding provider', d.embedding_provider_name],
       ['Provider ID', d.embedding_provider_id],
       ['Dimension', d.embedding_dim],
-      ['Embedding 状态', d.embedding_status],
+      ['Raw ingestion · 原文采集', statusLabel(d.raw_ingestion_status)],
+      ['Extractor · 提取器', statusLabel(d.extractor_status)],
+      ['Embedding provider · 向量模型', statusLabel(d.embedding_status)],
+      ['Vector index · 向量索引', statusLabel(d.vector_index_status)],
       ['调度器', d.scheduler_running ? '运行中' : '停止'],
     ];
     grid.innerHTML = items.map(([label, n]) =>
@@ -461,9 +474,21 @@ async function loadStats() {
     if (d.last_extracted_at) {
       const dt = new Date(d.last_extracted_at * 1000).toLocaleString();
       grid.insertAdjacentHTML('beforeend',
-        `<div class="stat"><div style="font-size:13px;font-weight:600">${dt}</div><div class="label">最近一次成功提取</div></div>`
+        `<div class="stat"><div style="font-size:13px;font-weight:600">${dt}</div><div class="label">最近一次有效提取（非空）</div></div>`
       );
     }
+    const health = d.health || {};
+    const times = {last_message_hook_seen_at:'最近用户消息hook',last_raw_ingest_at:'最近原文成功入库',
+      last_private_raw_at:'最近私聊原文入库',last_group_raw_at:'最近群聊原文入库',
+      last_extraction_attempt_at:'最近提取尝试',last_nonempty_extraction_at:'最近有效提取（非空）',
+      last_episode_written_at:'最近episode写入（含整理合并）'};
+    const warnings = ['watchdog_warning','startup_error','raw_error','database_error','embedding_error','diagnostics_write_error']
+      .filter(k => health[k]).map(k => `<div class="error">${escapeHtml(health[k])}</div>`).join('');
+    document.getElementById('healthDetails').innerHTML = `<div class="card">${warnings}
+      ${Object.entries(times).map(([k,label]) => `<div>${label}：${health[k] ? escapeHtml(new Date(health[k]*1000).toLocaleString()) : '暂无可验证记录'}</div>`).join('')}
+      <div class="ep-meta">最近跳过原因：${escapeHtml(health.last_raw_skip_reason || '无')}。没有消息信号不代表健康；本插件只能观察自己的消息/LLM hook。</div>
+      <details><summary>历史异常（最近30条，重载后保留）</summary>${(health.errors || []).slice().reverse().map(e =>
+        `<div>${escapeHtml(new Date(e.at*1000).toLocaleString())} · ${escapeHtml(e.component)} · ${escapeHtml(e.message)}</div>`).join('') || '暂无'}</details></div>`;
 
     if (d.active_sessions && d.active_sessions.length) {
       sess.innerHTML = '<table><thead><tr><th>session</th><th>类型</th><th>群号</th><th>未处理</th></tr></thead><tbody>'
@@ -768,6 +793,16 @@ async function runDebugRecall() {
 }
 
 // ============ Maintenance ============
+async function inspectHistory() {
+  const wrap = document.getElementById('historyInspection');
+  wrap.textContent = '正在只读检查…';
+  try {
+    const result = await api('diagnostics/history', {session_id:document.getElementById('historySession').value,
+      platform_id:document.getElementById('historyPlatform').value, page:document.getElementById('historyPage').value});
+    wrap.textContent = JSON.stringify(result, null, 2);
+  } catch(e) { wrap.textContent = `检查失败：${e.message}`; }
+}
+
 async function loadExtractionRuns(page=1) {
   const wrap = document.getElementById('extractionRuns');
   wrap.innerHTML = '<div class="loading">加载中…</div>';

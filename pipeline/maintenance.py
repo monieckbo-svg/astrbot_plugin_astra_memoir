@@ -339,7 +339,6 @@ class MaintenanceManager:
         for key, actions in grouped.items():
             text = f"{actions[0]['proposed_title']}\n{actions[0]['proposed_content']}"
             emb = await self.writer._embed(text)
-            if emb is None: raise MaintenanceError("合并记忆 embedding 失败，未应用任何修改")
             embeddings[key] = emb
         now = int(time.time())
         def _validate_sources():
@@ -385,7 +384,7 @@ class MaintenanceManager:
                         f"SELECT DISTINCT keyword FROM episode_keywords WHERE episode_id IN ({','.join('?'*len(sources))})",
                         [e["id"] for e in sources])]
                     self.db.insert_keywords(eid,keywords); self.db.insert_fts(eid,first["proposed_title"],first["proposed_content"],keywords)
-                    self.vec.upsert(eid,embeddings[key],chat_type=base["chat_type"],session_id=base["session_id"],group_id=base["group_id"])
+                    self.vec.optional_upsert(eid,embeddings[key],chat_type=base["chat_type"],session_id=base["session_id"],group_id=base["group_id"])
                     for e,a in zip(sources,actions):
                         self._set_state(e["id"],"archived",f"已合并到 #{eid}",merged_into=eid)
                         self.db.execute("INSERT INTO episode_merge_sources VALUES(?,?)",(eid,e["id"]))
@@ -403,7 +402,8 @@ class MaintenanceManager:
                         "restored_by_user=CASE WHEN ? THEN 1 ELSE restored_by_user END,"
                         "protected_until=COALESCE(?,protected_until) WHERE id=?",
                         (status,archived,reason,merged_into,int(user_restore),protected,eid))
-        self.db.execute("UPDATE episode_vec SET is_archived=? WHERE episode_id=?",(archived,eid))
+        if self.db.vector_ready:
+            self.db.execute("UPDATE episode_vec SET is_archived=? WHERE episode_id=?",(archived,eid))
 
     async def undo(self, run_id: int) -> dict:
         async with self._run_lock:
@@ -437,7 +437,8 @@ class MaintenanceManager:
                     archived = 0 if a["before_status"] == "active" else 1
                     self.db.execute("UPDATE episodes SET status=?,is_archived=?,archive_reason=?,merged_into=?,importance=? WHERE id=?",
                         (a["before_status"],archived,a["before_archive_reason"],a["before_merged_into"],a["before_importance"],a["source_episode_id"]))
-                    self.db.execute("UPDATE episode_vec SET is_archived=? WHERE episode_id=?",(archived,a["source_episode_id"]))
+                    if self.db.vector_ready:
+                        self.db.execute("UPDATE episode_vec SET is_archived=? WHERE episode_id=?",(archived,a["source_episode_id"]))
                 self.db.execute("UPDATE maintenance_runs SET status='undone',undone_at=? WHERE id=?",(now,run_id))
             return self.run_detail(run_id)
         return await self.db.run(_undo)
@@ -446,7 +447,6 @@ class MaintenanceManager:
         if not title.strip() or not content.strip() or not 1 <= importance <= 5:
             raise ValueError("标题、正文和 importance(1~5) 必须有效")
         emb = await self.writer._embed(f"{title.strip()}\n{content.strip()}")
-        if emb is None: raise MaintenanceError("编辑后的 embedding 失败，未保存")
         now = int(time.time())
         def _edit():
             ep=self.db.fetchone("SELECT * FROM episodes WHERE id=?",(eid,))
@@ -458,7 +458,7 @@ class MaintenanceManager:
                                 (title.strip(),content.strip(),importance,now+30*86400,eid))
                 keywords=[r["keyword"] for r in self.db.fetchall("SELECT keyword FROM episode_keywords WHERE episode_id=?",(eid,))]
                 self.db.execute("DELETE FROM episodes_fts WHERE rowid=?",(eid,)); self.db.insert_fts(eid,title.strip(),content.strip(),keywords)
-                self.vec.upsert(eid,emb,chat_type=ep["chat_type"],session_id=ep["session_id"],group_id=ep["group_id"],is_archived=ep["is_archived"])
+                self.vec.optional_upsert(eid,emb,chat_type=ep["chat_type"],session_id=ep["session_id"],group_id=ep["group_id"],is_archived=ep["is_archived"])
             return dict(self.db.fetchone("SELECT * FROM episodes WHERE id=?",(eid,)))
         return await self.db.run(_edit)
 
@@ -471,7 +471,6 @@ class MaintenanceManager:
         ep, version = await self.db.run(_load)
         if not ep or not version: raise ValueError("没有可撤销的编辑版本")
         emb = await self.writer._embed(f"{version['title']}\n{version['content']}")
-        if emb is None: raise MaintenanceError("旧版本 embedding 失败，未撤销")
         def _restore():
             with self.db.transaction():
                 self.db.execute("UPDATE episodes SET title=?,content=?,importance=?,protected_until=? WHERE id=?",
@@ -479,7 +478,7 @@ class MaintenanceManager:
                 self.db.execute("DELETE FROM episode_versions WHERE id=?", (version["id"],))
                 keywords=[r["keyword"] for r in self.db.fetchall("SELECT keyword FROM episode_keywords WHERE episode_id=?",(eid,))]
                 self.db.execute("DELETE FROM episodes_fts WHERE rowid=?",(eid,)); self.db.insert_fts(eid,version["title"],version["content"],keywords)
-                self.vec.upsert(eid,emb,chat_type=ep["chat_type"],session_id=ep["session_id"],group_id=ep["group_id"],is_archived=ep["is_archived"])
+                self.vec.optional_upsert(eid,emb,chat_type=ep["chat_type"],session_id=ep["session_id"],group_id=ep["group_id"],is_archived=ep["is_archived"])
             return dict(self.db.fetchone("SELECT * FROM episodes WHERE id=?",(eid,)))
         return await self.db.run(_restore)
 

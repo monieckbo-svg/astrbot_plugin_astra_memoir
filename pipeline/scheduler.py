@@ -292,8 +292,8 @@ class BatchScheduler:
                 (status,str(error)[:1000],int(time.time()),run_id)))
 
         try:
-            result = await self.extractor.extract(new_msgs, overlap_msgs, chat_type,
-                                                  memory_budget=budget, is_idle_flush=mode == 'idle')
+            result = await asyncio.wait_for(self.extractor.extract(new_msgs, overlap_msgs, chat_type,
+                                                  memory_budget=budget, is_idle_flush=mode == 'idle'), 120)
             await self.db.run(lambda: self.db.execute(
                 "UPDATE extraction_runs SET generated_count=?,skipped_importance1_count=?,"
                 "budget_trimmed_count=?,duplicate_count=?,discard_summary=?,"

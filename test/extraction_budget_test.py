@@ -61,7 +61,7 @@ async def case(importance, expected, *, invalid=False, duplicate=False, embeddin
         assert run['model'] == 'fixture-model'
         assert run['completed_at'] is not None
         unprocessed = db.fetchone('SELECT COUNT(*) FROM recent_messages WHERE processed_at IS NULL')[0]
-        if invalid or embedding_failure:
+        if invalid:
             assert run['status'] == 'failed' and unprocessed == 20 and run['error']
         else:
             assert run['status'] == 'success' and unprocessed == 0
@@ -81,7 +81,7 @@ async def case(importance, expected, *, invalid=False, duplicate=False, embeddin
         assert stats['status'] == 'ok', stats
         assert stats['data']['extraction_today']['runs'] == 1
         assert stats['data']['extraction_today']['stored'] == expected
-        assert stats['data']['episodes_per_100_raw'] == (None if invalid or embedding_failure else expected*5)
+        assert stats['data']['episodes_per_100_raw'] == (None if invalid else expected*5)
         with patch.object(panel_mod, 'astr_request', SimpleNamespace(query={'offset': '0'})):
             assert (await panel.extraction_runs())['data'][0]['run_id'] == run['run_id']
 
@@ -128,7 +128,7 @@ async def main():
     await case([1,2,5,4,3], 2)
     await case([5,4,3], 0, invalid=True)
     await case([3,3,3], 1, duplicate=True)
-    await case([4], 0, embedding_failure=True)
+    await case([4], 1, embedding_failure=True)
     await rollback_case()
     print('Extraction budget/audit/migration/retention tests passed')
 

@@ -48,9 +48,27 @@ class VecStore:
         )
 
     def delete(self, episode_id: int) -> None:
+        if not self.db.vector_ready:
+            return
         self.db.execute(
             "DELETE FROM episode_vec WHERE episode_id = ?", (episode_id,)
         )
+
+    def optional_upsert(self, episode_id, embedding, **metadata):
+        """Keep text edits even if the derived index fails; discard stale vectors."""
+        if not self.db.vector_ready:
+            return
+        self.db.execute('SAVEPOINT optional_vector')
+        try:
+            self.delete(episode_id)
+            if embedding is not None:
+                self.upsert(episode_id, embedding, **metadata)
+        except Exception as exc:
+            self.db.execute('ROLLBACK TO optional_vector')
+            self.db.vector_error = str(exc)
+            self.delete(episode_id)
+        finally:
+            self.db.execute('RELEASE optional_vector')
 
     def knn(
         self,
@@ -144,6 +162,8 @@ class VecStore:
         return [(r["episode_id"], r["distance"]) for r in rows]
 
     def count(self) -> int:
+        if not self.db.vector_ready:
+            return 0
         row = self.db.fetchone("SELECT COUNT(*) AS n FROM episode_vec")
         return row["n"] if row else 0
 
@@ -152,6 +172,9 @@ class VecStore:
         找 episodes 表里存在但 vec 表里缺失的 episode id。
         用于 vec 写失败后的 reindex。
         """
+        if not self.db.vector_ready:
+            return [r['id'] for r in self.db.fetchall(
+                "SELECT id FROM episodes WHERE status != 'trashed' ORDER BY id LIMIT ?", (limit,))]
         rows = self.db.fetchall(
             "SELECT e.id FROM episodes e "
             "LEFT JOIN episode_vec v ON v.episode_id = e.id "

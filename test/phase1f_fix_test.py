@@ -307,7 +307,7 @@ async def test_2_malformed_json_keeps_raw_unprocessed():
 
 
 async def test_3_embedding_failure_blocks_processed():
-    """embedding 失败 → 整批不能 silently processed"""
+    """Embedding failure preserves SQLite truth and a repairable missing vector."""
     db, vec, extractor, writer, scheduler, _ = await build_stack(
         SimpleGoodProvider(), embed=FailingEmbeddingProvider(),
     )
@@ -316,11 +316,12 @@ async def test_3_embedding_failure_blocks_processed():
     for i in range(3):
         await insert_priv_pair(db, session, "p", i, now + i * 10)
 
-    await scheduler.process_batch(session, mode="threshold")
-    assert count_unprocessed(db, session) == 6, "writer 失败时 raw 不得 silently processed"
-    assert db.fetchone("SELECT COUNT(*) AS n FROM episodes")["n"] == 0
+    await scheduler.process_batch(session, mode="idle")
+    assert count_unprocessed(db, session) == 0
+    assert db.fetchone("SELECT COUNT(*) AS n FROM episodes")["n"] == 1
+    assert len(vec.missing_episode_ids()) == 1
     db.close()
-    print("✓ 3. embedding 失败 → raw 保持 unprocessed，episode 未落库")
+    print("✓ 3. embedding 失败 → episode正文保留，raw processed，向量等待修复")
 
 
 async def test_4_bounded_batch_private_completed():
