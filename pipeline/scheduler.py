@@ -36,6 +36,9 @@ class SchedulerConfig:
     raw_retention_days: int = 30
     nightly_maintenance_enabled: bool = True
     nightly_maintenance_hour: int = 5
+    long_term_consolidation_enabled: bool = False
+    long_term_consolidation_day: int = 1
+    long_term_consolidation_hour: int = 3
 
 
 class BatchScheduler:
@@ -60,6 +63,7 @@ class BatchScheduler:
         self._background_tasks: set[asyncio.Task] = set()
         self._last_ttl_at: float = 0.0
         self._last_nightly_check: float = 0.0
+        self._last_long_term_check: float = 0.0
 
     # ---------- 生命周期 ----------
 
@@ -165,6 +169,15 @@ class BatchScheduler:
                 and datetime.now().hour >= self.config.nightly_maintenance_hour):
             self._last_nightly_check = now
             self._spawn(self._nightly_maintenance(), name="memoir-nightly")
+        local_now = datetime.now()
+        if (self.maintenance and self.config.long_term_consolidation_enabled
+                and now - self._last_long_term_check > 3600
+                and local_now.day >= self.config.long_term_consolidation_day
+                and (local_now.hour > self.config.long_term_consolidation_hour
+                     or (local_now.hour == self.config.long_term_consolidation_hour
+                         and local_now.minute >= 30))):
+            self._last_long_term_check = now
+            self._spawn(self._monthly_long_term_preview(), name="memoir-long-term-preview")
 
     def _should_trigger(
         self,
@@ -383,3 +396,24 @@ class BatchScheduler:
                     logger.exception("[Memoir] nightly maintenance failed for %s: %s", date_key, exc)
                     return
             day += timedelta(days=1)
+
+    async def _monthly_long_term_preview(self) -> None:
+        """At most one Preview per stage/month; never applies automatically."""
+        now = datetime.now()
+        month_start = int(datetime(now.year, now.month, 1).timestamp())
+        for stage in (1, 2, 3):
+            exists = await self.db.run(lambda s=stage: self.db.fetchone(
+                "SELECT 1 FROM maintenance_runs WHERE run_type='long_term' AND stage=? "
+                "AND created_at>=?",
+                (s, month_start)))
+            if exists:
+                continue
+            counts = await self.db.run(self.maintenance.long_term_candidate_counts)
+            if not counts.get(str(stage)):
+                continue
+            try:
+                await self.maintenance.preview_long_term(stage)
+                logger.info("[Memoir] monthly long-term stage %d Preview generated", stage)
+            except Exception:
+                logger.exception("[Memoir] monthly long-term stage %d Preview failed", stage)
+                return

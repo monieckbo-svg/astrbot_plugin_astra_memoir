@@ -85,7 +85,11 @@ CREATE TABLE IF NOT EXISTS episodes (
     edited_by_user      INTEGER NOT NULL DEFAULT 0,
     restored_by_user    INTEGER NOT NULL DEFAULT 0,
     protected_until     INTEGER,
-    created_by_run_id   INTEGER
+    created_by_run_id   INTEGER,
+    pinned              INTEGER NOT NULL DEFAULT 0,
+    consolidation_stage INTEGER NOT NULL DEFAULT 0,
+    last_consolidated_at REAL,
+    contains_user_edited_source INTEGER NOT NULL DEFAULT 0
 );
 
 -- 可逆生命周期。is_archived 为 vec0 兼容镜像：active=0，其余=1。
@@ -181,7 +185,8 @@ CREATE TABLE IF NOT EXISTS episode_merge_sources (
 
 CREATE TABLE IF NOT EXISTS maintenance_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_type TEXT NOT NULL CHECK(run_type IN ('history','nightly')),
+    run_type TEXT NOT NULL CHECK(run_type IN ('history','nightly','long_term')),
+    stage INTEGER,
     target_start INTEGER NOT NULL,
     target_end INTEGER NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('generating','preview','applied','undone','failed')),
@@ -214,7 +219,12 @@ CREATE TABLE IF NOT EXISTS maintenance_actions (
     before_status TEXT,
     before_archive_reason TEXT,
     before_merged_into INTEGER,
-    before_importance INTEGER
+    before_importance INTEGER,
+    before_consolidation_stage INTEGER NOT NULL DEFAULT 0,
+    before_last_consolidated_at REAL,
+    before_pinned INTEGER NOT NULL DEFAULT 0
+    ,before_title TEXT
+    ,before_content TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_maintenance_actions_run ON maintenance_actions(run_id);
 

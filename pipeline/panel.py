@@ -289,6 +289,7 @@ class MemoirPanel:
         group_id = _query("group_id")
         archived = _query("archived")
         status = _query("status")
+        pinned = _query("pinned")
         search = _query("q")
         date_filter = str(_query("date", "") or "").strip()
         date_start = date_end = None
@@ -327,6 +328,9 @@ class MemoirPanel:
             if status in ("active", "archived", "trashed"):
                 conditions.append("status = ?")
                 params.append(status)
+            if pinned in ("0", "1"):
+                conditions.append("pinned = ?")
+                params.append(int(pinned))
             if date_start is not None and date_end is not None:
                 # Include an episode when any part of its event overlaps the day.
                 conditions.extend(("event_start_at < ?", "event_end_at >= ?"))
@@ -628,6 +632,48 @@ class MemoirPanel:
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
+    async def long_term_status(self) -> dict:
+        try:
+            return {"status": "ok", "data": await self.db.run(
+                self.maintenance.long_term_candidate_counts)}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    async def long_term_preview(self) -> dict:
+        body = await _json_body()
+        try:
+            stage = int(body.get("stage", 0))
+            if self._maintenance_lock.locked():
+                return {"status": "error", "message": "已有整理任务正在生成 Preview"}
+            await self._maintenance_lock.acquire()
+            async def _background():
+                try:
+                    await self.maintenance.preview_long_term(stage)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("[Memoir] background long-term preview failed")
+                finally:
+                    self._maintenance_lock.release()
+            task = asyncio.create_task(_background(), name=f"memoir-long-term-stage-{stage}")
+            self._maintenance_tasks.add(task)
+            task.add_done_callback(self._maintenance_tasks.discard)
+            return {"status": "ok", "data": {"started": True, "stage": stage}}
+        except Exception as e:
+            if self._maintenance_lock.locked():
+                self._maintenance_lock.release()
+            return {"status": "error", "message": str(e)}
+
+    async def maintenance_revise(self, run_id: str) -> dict:
+        body = await _json_body()
+        try:
+            data = await self.db.run(
+                self.maintenance.revise_preview_action, int(run_id),
+                int(body.get("action_id", 0)), str(body.get("action", "")))
+            return {"status": "ok", "data": data}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
     # ---------- debug recall ----------
 
     async def debug_recall(self) -> dict:
@@ -743,6 +789,9 @@ def register_panel_routes(context, panel: MemoirPanel):
     async def h_maintenance_apply(run_id: str): return await panel.maintenance_apply(run_id)
     async def h_maintenance_undo(run_id: str): return await panel.maintenance_undo(run_id)
     async def h_maintenance_delete(run_id: str): return await panel.maintenance_delete(run_id)
+    async def h_maintenance_revise(run_id: str): return await panel.maintenance_revise(run_id)
+    async def h_long_term_status(): return await panel.long_term_status()
+    async def h_long_term_preview(): return await panel.long_term_preview()
     async def h_extraction_runs(): return await panel.extraction_runs()
     async def h_inspect_history(): return await panel.inspect_history()
 
@@ -807,5 +856,11 @@ def register_panel_routes(context, panel: MemoirPanel):
                              methods=["POST"], desc="Undo applied maintenance")
     context.register_web_api(f"{_ROUTE_PREFIX}/maintenance/runs/<run_id>/delete", h_maintenance_delete,
                              methods=["POST"], desc="Discard preview or delete failed run record")
+    context.register_web_api(f"{_ROUTE_PREFIX}/maintenance/runs/<run_id>/revise", h_maintenance_revise,
+                             methods=["POST"], desc="Revise one preview decision")
+    context.register_web_api(f"{_ROUTE_PREFIX}/maintenance/long-term/status", h_long_term_status,
+                             methods=["GET"], desc="Long-term consolidation candidate counts")
+    context.register_web_api(f"{_ROUTE_PREFIX}/maintenance/long-term/preview", h_long_term_preview,
+                             methods=["POST"], desc="Generate manual long-term Preview")
 
-    logger.info("[Memoir] panel API endpoints registered (19 routes)")
+    logger.info("[Memoir] panel API endpoints registered (22 routes)")

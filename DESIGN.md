@@ -434,7 +434,9 @@ req.extra_user_content_parts.append(
 
 episode 生命周期为 `active / archived / trashed`，`is_archived` 仅作为 sqlite-vec metadata 的兼容镜像。自动历史整理与 nightly maintenance 共用 `MaintenanceManager`：先在线备份数据库，按本地日期、原始来源和主题相似度拆成有上限的小批，模型只返回 `keep / archive / merge`。历史整理停在 Preview，必须由用户应用；nightly 只处理启用后已经结束的日期并自动应用。两者都写入 `maintenance_runs` 与 `maintenance_actions`，不执行永久删除。
 
-merge 创建新 episode，并以 `episode_merge_sources` 保存来源关系；旧 episode 归档并写 `merged_into`。撤销 run 恢复 action 快照中的状态、原因、importance 和合并关系，run 创建的新 episode 进入回收站。用户编辑使用 `episode_versions` 保存正文版本，不修改 source raw、participants 或来源 metadata；手动编辑、恢复后设置 30 天保护期。
+merge 创建新 episode，并以 `episode_merge_sources` 保存来源关系；旧 episode 归档并写 `merged_into`。撤销 run 恢复 action 快照中的状态、原因、importance、consolidation stage 和合并关系，run 创建的新 episode 进入回收站。用户编辑使用 `episode_versions` 保存正文版本，不修改 source raw、participants 或来源 metadata。`edited_by_user` / `restored_by_user` 只是审计标记，不再自动产生保护；只有用户明确设置的 `pinned=1` 会阻止 nightly、decay archive 与长期整理。
+
+长期二次睡眠使用 `consolidation_stage=0..3` 逐级处理 30、90、180 天以上的 active episode。候选先按主题、参与者和来源拆成至多 15 条的小组，再交给 LLM 做 keep/archive/merge；模型不能删除。长期整理固定先生成 Preview，用户可逐组改为 keep/archive，应用后可按 run 一键撤销。月度调度默认关闭；启用后仅在每月配置日期 03:30 后生成 Preview，永不自动应用。
 
 ---
 

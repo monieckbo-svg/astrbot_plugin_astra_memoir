@@ -78,8 +78,9 @@ git pull
 - “整理历史记忆”固定执行 `SQLite 在线备份 → 分日期/来源/主题小批生成 Preview → 用户确认应用`。部署不会自动扫描既有历史。
 - 整理模型只能 `keep / archive / merge`。merge 会生成新的完整 episode，原条目归档并记录双向关系；自动流程永不永久删除。
 - 每次整理保存 `maintenance_run` 和逐条 action，应用后可一键撤销。撤销产生的合并条目进入回收站，原条目恢复之前状态。
-- episode 可编辑标题、正文和 importance，编辑前保存版本；可撤销最近编辑。编辑和手动恢复后默认保护 30 天，也可在详情中取消保护。
+- episode 可编辑标题、正文和 importance，编辑前保存版本；可撤销最近编辑。编辑/恢复只是审计标记，不自动保护；只有用户明确点击“📌 保护”的 active 记忆才会跳过自动 archive/merge，仍正常参与召回。
 - 夜间整理默认服务器本地时间 05:00，只从该功能启用日开始逐日处理已经结束的日期；服务器离线后会补跑遗漏日期，不会扫描更早的历史库。
+- 长期二次睡眠按 30/90/180 天分三阶段压缩 active episode。面板固定先 Preview，可逐组改判并一键撤销；月度自动生成 Preview 默认关闭，即使启用也绝不自动应用。
 - 删除先进入回收站；永久删除只允许用户在回收站手动执行。
 
 其他可以先用默认。想调优时看：
@@ -89,6 +90,7 @@ git pull
 - `raw_retention_days`（默认 30） —— 原文保留天数
 - `nightly_maintenance_enabled` / `nightly_maintenance_hour` —— 夜间整理开关与本地小时（默认 05:00）
 - `maintenance_batch_size`（默认 12，最大 20）—— 单次交给整理模型的同日同来源小批上限
+- `long_term_consolidation_enabled` / `day` / `hour` —— 每月只生成长期整理 Preview，默认关闭；时间为配置日该小时的 30 分后
 
 ---
 
@@ -176,7 +178,7 @@ sqlite3 $DB "SELECT COUNT(*) FROM episode_vec;"
 - 群友画像 / 关系图
 - 日报 / 日记（astra-room 的活）
 - Discord（预留字段，代码不写）
-- 复杂记忆合并 / dream / cron 打包
+- 自动永久删除、人物画像、无 Preview 的高风险长期合并
 
 ---
 

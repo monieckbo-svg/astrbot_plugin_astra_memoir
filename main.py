@@ -39,7 +39,7 @@ RECOVERY_INTERVAL_SECONDS = 30
     PLUGIN_NAME,
     "Astra & Celii",
     "星星的自动记忆库 - 私聊/群聊事件消化",
-    "0.2.0",
+    "0.3.0",
     "https://github.com/monieckbo-svg/astrbot_plugin_astra_memoir",
 )
 class AstraMemoir(Star):
@@ -64,6 +64,9 @@ class AstraMemoir(Star):
             raw_retention_days=int(self._cfg("raw_retention_days", 30)),
             nightly_maintenance_enabled=bool(self._cfg("nightly_maintenance_enabled", True)),
             nightly_maintenance_hour=max(0, min(int(self._cfg("nightly_maintenance_hour", 5)), 23)),
+            long_term_consolidation_enabled=bool(self._cfg("long_term_consolidation_enabled", False)),
+            long_term_consolidation_day=max(1, min(int(self._cfg("long_term_consolidation_day", 1)), 28)),
+            long_term_consolidation_hour=max(0, min(int(self._cfg("long_term_consolidation_hour", 3)), 23)),
         )
 
         retr_cfg = RetrieverConfig(

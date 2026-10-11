@@ -99,7 +99,7 @@ async def main():
         preview2=await manager.preview(now-10,now+100,run_type="history")
         await manager.edit_episode(ids[0],"用户标题","用户修正文",5)
         ep=db.fetchone("SELECT * FROM episodes WHERE id=?",(ids[0],))
-        assert ep["edited_by_user"]==1 and ep["protected_until"]>int(time.time())
+        assert ep["edited_by_user"]==1 and ep["protected_until"] is None
         assert db.fetchone("SELECT COUNT(*) FROM episode_versions WHERE episode_id=?",(ids[0],))[0]==1
         try:
             await manager.apply(preview2["id"])
@@ -121,7 +121,7 @@ async def main():
         assert db.fetchone("SELECT status FROM episodes WHERE id=?",(ids[0],))[0]=="trashed"
         manager.manual_state(ids[0],"restore")
         ep=db.fetchone("SELECT * FROM episodes WHERE id=?",(ids[0],))
-        assert ep["status"]=="active" and ep["restored_by_user"]==1 and ep["protected_until"]>int(time.time())
+        assert ep["status"]=="active" and ep["restored_by_user"]==1 and ep["protected_until"] is None
         db.close()
     print("Maintenance test passed")
 

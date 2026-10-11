@@ -176,6 +176,7 @@
       <select id="epArchived">
         <option value="active">活跃记忆</option>
       </select>
+      <select id="epPinned"><option value="">全部保护状态</option><option value="0">普通</option><option value="1">📌 已保护</option></select>
       <label>日期 <input type="date" id="epDate"></label>
       <input type="search" id="epSearch" placeholder="搜索标题/内容/关键词（FTS）">
       <input type="text" id="epParticipant" placeholder="Participant QQ" style="width: 120px">
@@ -203,6 +204,17 @@
   </div>
 
   <div id="maintenance" class="tab-content" hidden>
+    <div class="card">
+      <b>长期整理（二次睡眠，固定先 Preview）</b>
+      <p class="ep-meta">只处理达到年龄且尚未完成当前阶段的活跃记忆；已保护条目不会进入候选。自动任务默认关闭，即使启用也只生成 Preview，绝不自动应用或删除。</p>
+      <div id="longTermCounts" class="ep-meta">正在读取候选数量…</div>
+      <div class="toolbar">
+        <button onclick="previewLongTerm(1)">生成 30~90 天阶段 Preview</button>
+        <button onclick="previewLongTerm(2)">生成 90~180 天阶段 Preview</button>
+        <button onclick="previewLongTerm(3)">生成 180 天以上阶段 Preview</button>
+        <span id="longTermResult"></span>
+      </div>
+    </div>
     <div class="card">
       <b>整理历史记忆（固定先 Preview）</b>
       <p class="ep-meta">开始前自动备份 memoir.db；按日期、来源和主题拆成小批。Preview 不改 episode，查看后再应用。</p>
@@ -552,11 +564,13 @@ async function loadEpisodes(resetPage=false) {
   const q = document.getElementById('epSearch').value.trim();
   const pt = document.getElementById('epParticipant').value.trim();
   const status = document.getElementById('epArchived').value;
+  const pinned = document.getElementById('epPinned').value;
   if (ct) params.chat_type = ct;
   if (date) params.date = date;
   if (q) params.q = q;
   if (pt) params.participant = pt;
   if (status) params.status = status;
+  if (pinned) params.pinned = pinned;
   params.limit = EPISODE_PAGE_SIZE + 1;
   params.offset = (episodePages.active - 1) * EPISODE_PAGE_SIZE;
   try {
@@ -574,10 +588,11 @@ async function loadEpisodes(resetPage=false) {
       const tag = ep.chat_type === 'group' ? 'tag-group' : 'tag-private';
       const tagLabel = ep.chat_type === 'group' ? '群聊' : '私聊';
       return `<div class="card" onclick="loadDetail(${ep.id})" style="cursor:pointer">
-        <div class="ep-title"><span class="tag ${tag}">${tagLabel}</span>${escapeHtml(ep.title)}</div>
-        <div class="ep-meta">${dt} · #${ep.id} · importance=${ep.importance ?? 3} · ${escapeHtml(ep.status || 'active')} · 强化 ${ep.reinforcement_count ?? 0} 次</div>
+        <div class="ep-title"><span class="tag ${tag}">${tagLabel}</span>${ep.pinned ? '📌 ' : ''}${escapeHtml(ep.title)}</div>
+        <div class="ep-meta">${dt} · #${ep.id} · importance=${ep.importance ?? 3} · stage=${ep.consolidation_stage ?? 0} · ${escapeHtml(ep.status || 'active')} · 强化 ${ep.reinforcement_count ?? 0} 次</div>
         <div class="ep-content">${escapeHtml(ep.content)}</div>
         <div class="ep-parts">参与者：${escapeHtml(parts)}</div>
+        <div class="toolbar"><button onclick="event.stopPropagation();toggleEpisodePin(${ep.id},'${ep.pinned ? 'unpin' : 'pin'}')">${ep.pinned ? '📌 已保护' : '📌 保护'}</button></div>
       </div>`;
     }).join('') + episodePager('active', hasNext);
   } catch (e) {
@@ -603,7 +618,7 @@ async function loadStateEpisodes(status, resetPage=false) {
     }
     wrap.innerHTML = eps.map(ep => `<div class="card">
       <div class="ep-title" onclick="loadDetail(${ep.id})" style="cursor:pointer">#${ep.id} ${escapeHtml(ep.title)}</div>
-      <div class="ep-meta">${new Date(ep.event_start_at * 1000).toLocaleString()} · importance=${ep.importance} · ${escapeHtml(ep.archive_reason || '未记录原因')}</div>
+      <div class="ep-meta">${new Date(ep.event_start_at * 1000).toLocaleString()} · importance=${ep.importance} · ${escapeHtml(archiveReasonLabel(ep.archive_reason) || '未记录原因')}</div>
       <div class="ep-content">${escapeHtml(ep.content)}</div>
       <div class="toolbar"><button onclick="episodeAction(${ep.id},'restore')">恢复</button>
       <button onclick="loadDetail(${ep.id})">编辑/详情</button>
@@ -616,11 +631,16 @@ async function episodeAction(id, action, dangerous=false) {
   if (dangerous && !await askConfirm('永久删除后无法恢复，确认继续？')) return;
   try {
     await apiPost(`episodes/${id}/action`, {action});
-    if (action === 'undo_edit') { await loadDetail(id); return; }
+    if (['undo_edit','pin','unpin','unprotect'].includes(action)) { await loadDetail(id); return; }
     if (document.getElementById('archive').hidden === false) loadStateEpisodes('archived');
     else if (document.getElementById('trash').hidden === false) loadStateEpisodes('trashed');
     else loadEpisodes();
   } catch (e) { alert(`操作失败：${e.message}`); }
+}
+
+async function toggleEpisodePin(id, action) {
+  try { await apiPost(`episodes/${id}/action`, {action}); await loadEpisodes(); }
+  catch(e) { alert(`保护状态修改失败：${e.message}`); }
 }
 
 // ============ Episode Detail ============
@@ -656,13 +676,15 @@ async function loadDetail(id) {
     c.innerHTML = `
       <div class="card">
         <div class="ep-title" style="font-size:18px">
-          <span class="tag ${tag}">${tagLabel}</span>${escapeHtml(ep.title)}
+          <span class="tag ${tag}">${tagLabel}</span>${ep.pinned ? '📌 ' : ''}${escapeHtml(ep.title)}
         </div>
-        <div class="ep-meta">${dt} · importance=${ep.importance ?? 3} · ${escapeHtml(ep.status || 'active')} · ${escapeHtml(ep.archive_reason || '')} · 强化 ${ep.reinforcement_count ?? 0} 次</div>
+        <div class="ep-meta">${dt} · importance=${ep.importance ?? 3} · consolidation stage=${ep.consolidation_stage ?? 0} · ${escapeHtml(ep.status || 'active')} · ${escapeHtml(archiveReasonLabel(ep.archive_reason))} · 强化 ${ep.reinforcement_count ?? 0} 次</div>
+        ${ep.contains_user_edited_source ? '<div class="card">此合并记忆包含用户修正过的来源记忆，请核对后再应用后续整理。</div>' : ''}
         <label>标题 <input id="editTitle" value="${escapeHtml(ep.title)}" style="width:100%"></label>
         <label>正文 <textarea id="editContent" rows="6" style="width:100%">${escapeHtml(ep.content)}</textarea></label>
         <label>重要性 <input id="editImportance" type="number" min="1" max="5" value="${ep.importance ?? 3}"></label>
         <div class="toolbar"><button onclick="saveEpisodeEdit(${ep.id})">保存修改</button>
+        ${ep.status === 'active' ? `<button onclick="episodeAction(${ep.id},'${ep.pinned ? 'unpin' : 'pin'}')">${ep.pinned ? '📌 已保护（点击取消）' : '📌 保护'}</button>` : ''}
         ${(ep.versions || []).length ? `<button onclick="episodeAction(${ep.id},'undo_edit')">撤销最近编辑</button>` : ''}
         ${ep.protected_until && ep.protected_until * 1000 > Date.now() ? `<button onclick="episodeAction(${ep.id},'unprotect')">取消30天保护</button>` : ''}
         ${ep.status === 'active' ? `<button onclick="episodeAction(${ep.id},'archive')">归档</button><button onclick="episodeAction(${ep.id},'trash')">删除到回收站</button>` : `<button onclick="episodeAction(${ep.id},'restore')">恢复</button>`}</div>
@@ -838,24 +860,44 @@ async function previewMaintenance() {
   } catch (e) { result.textContent = `生成失败：${e.message}`; }
 }
 
+async function loadLongTermCounts() {
+  const wrap = document.getElementById('longTermCounts');
+  if (!wrap) return;
+  try {
+    const d = await api('maintenance/long-term/status');
+    wrap.textContent = `待整理：30~90天阶段 ${d['1'] || 0} 条 · 90~180天阶段 ${d['2'] || 0} 条 · 180天以上阶段 ${d['3'] || 0} 条`;
+  } catch(e) { wrap.textContent = `候选统计失败：${e.message}`; }
+}
+
+async function previewLongTerm(stage) {
+  const result = document.getElementById('longTermResult');
+  result.textContent = '正在备份并生成 Preview…';
+  try {
+    await apiPost('maintenance/long-term/preview', {stage});
+    result.textContent = `阶段 ${stage} 已在后台开始，只会生成方案。`;
+    await loadMaintenanceRuns();
+  } catch(e) { result.textContent = `生成失败：${e.message}`; }
+}
+
 async function loadMaintenanceRuns() {
   const wrap = document.getElementById('maintenanceRuns');
   try {
     const runs = await api('maintenance/runs');
+    await loadLongTermCounts();
     if (!runs.length) { wrap.innerHTML = '<div class="empty">暂无整理记录</div>'; return; }
     const statusLabels = {
       generating: '生成中', preview: '待确认', applied: '已应用（仍可撤销）',
       undone: '已撤销', failed: '失败'
     };
     wrap.innerHTML = runs.map(r => `<div class="card maintenance-run run-${escapeHtml(r.status)}">
-      <div class="ep-title">#${r.id} ${r.run_type === 'nightly' ? '每日整理' : '历史整理'}<span class="run-status status-${escapeHtml(r.status)}">${escapeHtml(statusLabels[r.status] || r.status)}</span></div>
+      <div class="ep-title">#${r.id} ${r.run_type === 'nightly' ? '每日整理' : (r.run_type === 'long_term' ? `长期整理 · 阶段${r.stage}` : '历史整理')}<span class="run-status status-${escapeHtml(r.status)}">${escapeHtml(statusLabels[r.status] || r.status)}</span></div>
       <div class="ep-meta">原始 ${r.source_count} 条 → 保留 ${r.keep_count} → ${r.merge_source_count} 条合并成 ${r.merge_result_count} 条 → 归档 ${r.archive_count} → 自动删除 0</div>
       ${r.status === 'generating' ? `<div class="ep-meta">模型整理进度：${r.completed_batches || 0} / ${r.batch_count || '?'} 批</div>` : ''}
       ${r.status === 'failed' ? `<div class="error">失败原因：${escapeHtml(r.error || '未知错误，请查看 AstrBot 日志')}</div>` : ''}
       <div class="ep-meta">备份：${escapeHtml(r.backup_path || '-')}</div>
       <div class="toolbar">${r.status !== 'failed' ? `<button onclick="showMaintenanceRun(${r.id})">查看方案</button>` : ''}
-      ${r.status === 'preview' && (r.logic_version || 1) >= 3 ? `<button onclick="applyMaintenance(${r.id})">应用整理结果</button>` : ''}
-      ${r.status === 'preview' && (r.logic_version || 1) < 3 ? `<span class="error">旧版人称/姓名规则方案，已禁用；请重新生成 Preview</span>` : ''}
+      ${r.status === 'preview' && (r.logic_version || 1) >= 4 ? `<button onclick="applyMaintenance(${r.id})">应用整理结果</button>` : ''}
+      ${r.status === 'preview' && (r.logic_version || 1) < 4 ? `<span class="error">旧版整理规则方案，已禁用；请重新生成 Preview</span>` : ''}
       ${r.status === 'preview' ? `<button onclick="deleteMaintenanceRun(${r.id},'preview')">放弃方案</button>` : ''}
       ${r.status === 'failed' ? `<button onclick="deleteMaintenanceRun(${r.id},'failed')">删除失败记录</button>` : ''}
       ${r.status === 'applied' ? `<button onclick="undoMaintenance(${r.id})">撤销本次整理</button>` : ''}</div>
@@ -875,8 +917,15 @@ async function showMaintenanceRun(id) {
     const a = items[0];
     return `<div style="border-top:1px solid var(--border);padding:8px 0"><b>${escapeHtml(a.action)}</b> ${items.map(x=>'#'+x.source_episode_id+' '+escapeHtml(x.source_title)).join('、')}
       <div class="ep-meta">${escapeHtml(a.reason || '')} · 新 importance=${a.proposed_importance}</div>
-      ${a.action === 'merge' ? `<div><b>${escapeHtml(a.proposed_title)}</b><br>${escapeHtml(a.proposed_content)}</div>` : ''}</div>`;
+      ${items.some(x => x.source_edited_by_user) ? '<div class="error">此建议包含用户修正过的来源；请核对新内容没有改回旧错误。</div>' : ''}
+      ${a.action === 'merge' ? `<div><b>${escapeHtml(a.proposed_title)}</b><br>${escapeHtml(a.proposed_content)}</div>` : ''}
+      ${run.status === 'preview' ? `<div class="toolbar"><button onclick="reviseMaintenance(${run.id},${a.id},'keep')">改为保留${a.action==='merge'?'（取消此合并）':''}</button><button onclick="reviseMaintenance(${run.id},${a.id},'archive')">改为归档</button></div>` : ''}</div>`;
   }).join('');
+}
+
+async function reviseMaintenance(runId, actionId, action) {
+  try { await apiPost(`maintenance/runs/${runId}/revise`, {action_id:actionId, action}); await loadMaintenanceRuns(); await showMaintenanceRun(runId); }
+  catch(e) { alert(`调整失败：${e.message}`); }
 }
 
 async function applyMaintenance(id) {
@@ -906,6 +955,11 @@ function escapeHtml(s) {
   return String(s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;')
     .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function archiveReasonLabel(reason) {
+  return ({long_term_duplicate:'长期重复',long_term_merged:'长期合并',
+    long_term_low_value:'长期价值下降',long_term_expired:'阶段信息已过期'}[reason] || reason || '');
 }
 
 // ============ Boot ============

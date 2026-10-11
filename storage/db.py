@@ -104,6 +104,10 @@ class MemoirDB:
             ("restored_by_user", "INTEGER NOT NULL DEFAULT 0"),
             ("protected_until", "INTEGER"),
             ("created_by_run_id", "INTEGER"),
+            ("pinned", "INTEGER NOT NULL DEFAULT 0"),
+            ("consolidation_stage", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_consolidated_at", "REAL"),
+            ("contains_user_edited_source", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if name not in episode_columns:
                 conn.execute(f"ALTER TABLE episodes ADD COLUMN {name} {definition}")
@@ -120,12 +124,62 @@ class MemoirDB:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ep_status_time ON episodes(status, event_start_at)"
         )
-        run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(maintenance_runs)")}
+        # Old databases have a CHECK constraint that rejects run_type=long_term.
+        # Rebuild only this audit table while preserving ids and child actions.
+        run_sql = (conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='maintenance_runs'"
+        ).fetchone() or [""])[0] or ""
+        pre_run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(maintenance_runs)")}
         for name in ("batch_count", "completed_batches", "logic_version"):
-            if name not in run_columns:
+            if name not in pre_run_columns:
                 conn.execute(
-                    f"ALTER TABLE maintenance_runs ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
-                )
+                    f"ALTER TABLE maintenance_runs ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
+        if "long_term" not in run_sql:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.executescript("""
+                CREATE TABLE maintenance_runs_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_type TEXT NOT NULL CHECK(run_type IN ('history','nightly','long_term')),
+                    stage INTEGER,
+                    target_start INTEGER NOT NULL,target_end INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('generating','preview','applied','undone','failed')),
+                    backup_path TEXT,source_count INTEGER NOT NULL DEFAULT 0,
+                    keep_count INTEGER NOT NULL DEFAULT 0,archive_count INTEGER NOT NULL DEFAULT 0,
+                    merge_source_count INTEGER NOT NULL DEFAULT 0,merge_result_count INTEGER NOT NULL DEFAULT 0,
+                    batch_count INTEGER NOT NULL DEFAULT 0,completed_batches INTEGER NOT NULL DEFAULT 0,
+                    logic_version INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL,
+                    applied_at INTEGER,undone_at INTEGER,error TEXT
+                );
+                INSERT INTO maintenance_runs_new(
+                    id,run_type,target_start,target_end,status,backup_path,source_count,keep_count,
+                    archive_count,merge_source_count,merge_result_count,batch_count,completed_batches,
+                    logic_version,created_at,applied_at,undone_at,error)
+                SELECT id,run_type,target_start,target_end,status,backup_path,source_count,keep_count,
+                    archive_count,merge_source_count,merge_result_count,batch_count,completed_batches,
+                    logic_version,created_at,applied_at,undone_at,error FROM maintenance_runs;
+                DROP TABLE maintenance_runs;
+                ALTER TABLE maintenance_runs_new RENAME TO maintenance_runs;
+            """)
+            conn.execute("PRAGMA foreign_keys=ON")
+        run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(maintenance_runs)")}
+        for name, definition in (
+            ("batch_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("completed_batches", "INTEGER NOT NULL DEFAULT 0"),
+            ("logic_version", "INTEGER NOT NULL DEFAULT 0"),
+            ("stage", "INTEGER"),
+        ):
+            if name not in run_columns:
+                conn.execute(f"ALTER TABLE maintenance_runs ADD COLUMN {name} {definition}")
+        action_columns = {row["name"] for row in conn.execute("PRAGMA table_info(maintenance_actions)")}
+        for name, definition in (
+            ("before_consolidation_stage", "INTEGER NOT NULL DEFAULT 0"),
+            ("before_last_consolidated_at", "REAL"),
+            ("before_pinned", "INTEGER NOT NULL DEFAULT 0"),
+            ("before_title", "TEXT"),
+            ("before_content", "TEXT"),
+        ):
+            if name not in action_columns:
+                conn.execute(f"ALTER TABLE maintenance_actions ADD COLUMN {name} {definition}")
 
         self._conn = conn
         if defer_vectors:
@@ -146,6 +200,13 @@ class MemoirDB:
             "UPDATE maintenance_days SET status='failed', updated_at=strftime('%s','now') "
             "WHERE status='running'"
         )
+        if self.get_meta("explicit_protection_semantics_v1") != "1":
+            # Earlier releases created these windows implicitly on edit/restore.
+            # No explicit temporary-protection UI existed, so they are safe to retire once.
+            conn.execute(
+                "UPDATE episodes SET protected_until=NULL "
+                "WHERE edited_by_user=1 OR restored_by_user=1")
+            self.set_meta("explicit_protection_semantics_v1", "1")
         if self.get_meta("identity_backfill_done") != "1":
             self.identities.backfill()
             self.set_meta("identity_backfill_done", "1")
@@ -523,7 +584,7 @@ class MemoirDB:
         cutoff = now_ts - 30 * 86400
         with self.transaction():
             rows = self.fetchall(
-                "SELECT id FROM episodes WHERE importance = 2 AND status='active' "
+                "SELECT id FROM episodes WHERE importance = 2 AND status='active' AND pinned=0 "
                 "AND (protected_until IS NULL OR protected_until <= ?) "
                 "AND COALESCE(CAST(strftime('%s', last_reinforced_at) AS INTEGER), event_end_at) < ?",
                 (now_ts, cutoff),

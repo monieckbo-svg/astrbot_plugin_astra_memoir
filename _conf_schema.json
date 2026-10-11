@@ -109,5 +109,21 @@
     "description": "每个整理小批最多包含多少条同日同来源 episode",
     "type": "int",
     "default": 12
+  },
+  "long_term_consolidation_enabled": {
+    "description": "每月自动生成长期整理 Preview（绝不自动应用）",
+    "type": "bool",
+    "default": false,
+    "hint": "第一版建议关闭；可先在 Memoir 面板手动生成并检查长期整理方案。"
+  },
+  "long_term_consolidation_day": {
+    "description": "每月生成长期整理 Preview 的日期（1~28）",
+    "type": "int",
+    "default": 1
+  },
+  "long_term_consolidation_hour": {
+    "description": "每月生成长期整理 Preview 的小时（服务器本地时间，会在该小时的30分后执行）",
+    "type": "int",
+    "default": 3
   }
 }
