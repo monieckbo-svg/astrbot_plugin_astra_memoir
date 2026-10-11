@@ -67,6 +67,11 @@
   }
   .stat .n { font-size: 22px; font-weight: 600; color: var(--accent); }
   .stat .label { font-size: 12px; color: var(--muted); }
+  .stat.health-healthy .n, .raw-health.health-healthy { color: #218739; }
+  .stat.health-idle .n, .raw-health.health-idle { color: var(--muted); }
+  .stat.health-pending .n, .raw-health.health-pending { color: #b77900; }
+  .stat.health-error { border-color: #cf7777; }
+  .stat.health-error .n, .raw-health.health-error { color: #c33; }
 
   .tag {
     display: inline-block; padding: 2px 8px; border-radius: 3px;
@@ -447,10 +452,13 @@ async function loadStats() {
   grid.innerHTML = '<div class="loading">加载中…</div>';
   try {
     const d = await api('stats');
-    const statusLabel = value => ({ok:'正常',degraded:'降级 / 等待恢复',missing:'有缺失向量',
+    const statusLabel = value => ({ok:'正常',healthy:'正常',idle:'空闲 / 暂无新消息',
+      pending:'等待原文入库',degraded:'降级 / 等待恢复',missing:'有缺失向量',
       unknown:'无法确认',waiting:'等待首次记录',observed:'近期hook有活动',stalled:'采集停滞报警',
       error:'异常',failed:'最近提取失败',interrupted:'最近提取中断',success:'最近提取成功',
       running:'正在提取',stopped:'已停止'}[value] || value || '无法确认');
+    const rawStatusLabel = value => ({healthy:'正常',idle:'空闲 / 暂无新消息',
+      pending:'等待原文入库',error:'原文采集异常'}[value] || statusLabel(value));
     const active = d.episodes_active ?? Math.max(0, (d.episodes_total || 0) - (d.episodes_archived || 0) - (d.episodes_trashed || 0));
     const vectorEligible = Math.max(0, (d.episodes_total || 0) - (d.episodes_trashed || 0));
     const items = [
@@ -473,14 +481,14 @@ async function loadStats() {
       ['Embedding provider', d.embedding_provider_name],
       ['Provider ID', d.embedding_provider_id],
       ['Dimension', d.embedding_dim],
-      ['Raw ingestion · 原文采集', statusLabel(d.raw_ingestion_status)],
+      ['Raw ingestion · 原文采集', rawStatusLabel(d.raw_ingestion_status), `health-${d.raw_ingestion_status || 'idle'}`],
       ['Extractor · 提取器', statusLabel(d.extractor_status)],
       ['Embedding provider · 向量模型', statusLabel(d.embedding_status)],
       ['Vector index · 向量索引', statusLabel(d.vector_index_status)],
       ['调度器', d.scheduler_running ? '运行中' : '停止'],
     ];
-    grid.innerHTML = items.map(([label, n]) =>
-      `<div class="stat"><div class="n">${escapeHtml(n)}</div><div class="label">${escapeHtml(label)}</div></div>`
+    grid.innerHTML = items.map(([label, n, cls='']) =>
+      `<div class="stat ${escapeHtml(cls)}"><div class="n">${escapeHtml(n)}</div><div class="label">${escapeHtml(label)}</div></div>`
     ).join('');
 
     if (d.last_extracted_at) {
@@ -490,15 +498,18 @@ async function loadStats() {
       );
     }
     const health = d.health || {};
-    const times = {last_message_hook_seen_at:'最近用户消息hook',last_raw_ingest_at:'最近原文成功入库',
+    const times = {last_message_hook_seen_at:'最近消息hook被调用',last_user_hook_at:'最近可入库用户hook',
+      last_private_hook_at:'最近私聊用户hook',last_group_hook_at:'最近群聊用户hook',last_raw_ingest_at:'最近原文成功入库',
       last_private_raw_at:'最近私聊原文入库',last_group_raw_at:'最近群聊原文入库',
       last_extraction_attempt_at:'最近提取尝试',last_nonempty_extraction_at:'最近有效提取（非空）',
       last_episode_written_at:'最近episode写入（含整理合并）'};
     const warnings = ['watchdog_warning','startup_error','raw_error','database_error','embedding_error','diagnostics_write_error']
       .filter(k => health[k]).map(k => `<div class="error">${escapeHtml(health[k])}</div>`).join('');
     document.getElementById('healthDetails').innerHTML = `<div class="card">${warnings}
+      <div class="raw-health health-${escapeHtml(d.raw_ingestion_status || 'idle')}"><b>${escapeHtml(health.ingestion_message || statusLabel(d.raw_ingestion_status))}</b></div>
+      <div class="ep-meta">私聊：${escapeHtml(statusLabel(health.private_ingestion_status || 'idle'))} · 群聊：${escapeHtml(statusLabel(health.group_ingestion_status || 'idle'))}</div>
       ${Object.entries(times).map(([k,label]) => `<div>${label}：${health[k] ? escapeHtml(new Date(health[k]*1000).toLocaleString()) : '暂无可验证记录'}</div>`).join('')}
-      <div class="ep-meta">最近跳过原因：${escapeHtml(health.last_raw_skip_reason || '无')}。没有消息信号不代表健康；本插件只能观察自己的消息/LLM hook。</div>
+      <div class="ep-meta">最近跳过原因：${escapeHtml(health.last_raw_skip_reason || '无')}。近期没有真实用户 hook 时显示空闲，不会仅因 raw 长时间未更新而报警。</div>
       <details><summary>历史异常（最近30条，重载后保留）</summary>${(health.errors || []).slice().reverse().map(e =>
         `<div>${escapeHtml(new Date(e.at*1000).toLocaleString())} · ${escapeHtml(e.component)} · ${escapeHtml(e.message)}</div>`).join('') || '暂无'}</details></div>`;
 

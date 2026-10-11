@@ -39,7 +39,7 @@ RECOVERY_INTERVAL_SECONDS = 30
     PLUGIN_NAME,
     "Astra & Celii",
     "星星的自动记忆库 - 私聊/群聊事件消化",
-    "0.3.0",
+    "0.3.1",
     "https://github.com/monieckbo-svg/astrbot_plugin_astra_memoir",
 )
 class AstraMemoir(Star):

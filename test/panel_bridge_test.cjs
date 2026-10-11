@@ -31,7 +31,9 @@ const bridge = {
       episodes_today: 1, raw_total: 1, raw_unprocessed: 0,
       vec_missing: 0, vec_covered: 1, scheduler_running: true,
       embedding_provider_name: 'test', embedding_provider_id: 'test',
-      embedding_dim: 8, embedding_status: 'ok', active_sessions: [],
+      embedding_dim: 8, embedding_status: 'ok', raw_ingestion_status: 'idle',
+      health: {ingestion_message:'近期暂无新消息，采集器待命中',
+        private_ingestion_status:'idle',group_ingestion_status:'idle'}, active_sessions: [],
     };
     if (route === 'episodes') { lastEpisodeParams = params; return [episode]; }
     if (route === 'identities') return [{qq_id: '111', canonical_name: '陆忱',
@@ -67,6 +69,9 @@ vm.runInNewContext(script, sandbox);
   await sandbox.loadStats();
   assert.match(element('statsGrid').innerHTML, /活跃记忆 \/ 总记忆/);
   assert.match(element('statsGrid').innerHTML, /1 \/ 3/);
+  assert.match(element('statsGrid').innerHTML, /空闲 \/ 暂无新消息/);
+  assert.match(element('healthDetails').innerHTML, /近期暂无新消息，采集器待命中/);
+  assert.doesNotMatch(element('healthDetails').innerHTML, /class="error"/);
   await sandbox.loadEpisodes();
   assert.match(element('episodesList').innerHTML, /真实记忆/);
   assert.equal(calls[2], 'episodes');

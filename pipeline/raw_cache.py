@@ -36,16 +36,18 @@ class RawCache:
         self.bot_display_name = bot_display_name
         self.health = health
 
-    def _observed(self, row_id, event):
+    def _observed(self, row_id, event, *, is_user=False):
         if not self.health:
             return
-        if row_id is None:
-            self.health.update(last_raw_skip_reason='重复消息', raw_pending_since=0)
+        chat_type = self._chat_type_of(event)
+        if is_user:
+            # A dedupe hit proves that the corresponding original raw exists.
+            self.health.raw_ingested(chat_type, duplicate=row_id is None)
+        elif row_id is None:
+            self.health.update(last_raw_skip_reason='重复 assistant 原文')
         else:
-            now = int(time.time())
-            key = 'last_group_raw_at' if event.get_group_id() else 'last_private_raw_at'
-            self.health.update(last_raw_ingest_at=now, **{key: now}, raw_error=None,
-                               raw_pending_since=0, last_raw_skip_reason=None)
+            self.health.update(last_raw_ingest_at=int(time.time()), raw_error=None,
+                               last_raw_skip_reason=None)
 
     # ---------- Helpers ----------
 
@@ -76,14 +78,16 @@ class RawCache:
         返回：新行 id；已存在（dedupe 命中）返回 None；异常返回 None 并日志。
         """
         try:
-            if self.health:
-                self.health.update(last_message_hook_seen_at=int(time.time()))
             content = event.get_message_str()
             if not content or not content.strip():
                 # 纯图片/表情/命令等 —— 也可以先记，但 V1 先跳过无字消息避免噪声
                 if self.health:
                     self.health.update(last_raw_skip_reason='无文本消息，按现有规则跳过')
                 return None
+
+            chat_type = self._chat_type_of(event)
+            if self.health:
+                self.health.user_hook(chat_type)
 
             session_id = event.unified_msg_origin
             platform_message_id = self._get_platform_message_id(event)
@@ -98,9 +102,6 @@ class RawCache:
             group_id = event.get_group_id() or None
 
             key = user_dedupe_key(session_id, platform_message_id)
-            if self.health and not self.health.data.get('raw_pending_since'):
-                self.health.update(raw_pending_since=int(time.time()))
-
             def _insert():
                 # 即使 Astra 尚未产生可缓存的回复，也先建自己的身份卡。
                 self.db.identities.observe(event.get_self_id(), self.bot_display_name, "assistant")
@@ -121,7 +122,7 @@ class RawCache:
                 )
 
             row_id = await self.db.run(_insert)
-            self._observed(row_id, event)
+            self._observed(row_id, event, is_user=True)
             return row_id
         except Exception as exc:
             if self.health:

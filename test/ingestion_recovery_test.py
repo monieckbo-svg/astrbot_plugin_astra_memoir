@@ -53,6 +53,11 @@ async def main():
             stats = (await app.panel.get_stats())['data']
             assert stats['embedding_status'] == 'degraded'
             assert stats['health']['last_raw_ingest_at']
+            assert stats['health']['last_user_hook_at']
+            assert stats['health']['last_group_hook_at']
+            assert stats['raw_ingestion_status'] == 'healthy'
+            assert stats['health']['group_ingestion_status'] == 'healthy'
+            assert stats['health']['private_ingestion_status'] == 'idle'
             assert stats['health']['last_nonempty_extraction_at']
 
             ctx.embedding = OkEmbeddingProvider()
@@ -87,8 +92,10 @@ async def main():
             assert persisted.data['errors'][-1]['message'] == 'disk full'
             now = int(time.time())
             persisted.data.update(started_at=now-600,last_raw_ingest_at=now-600,
-                                  last_llm_activity_at=now,raw_pending_since=now-600)
-            assert persisted.watchdog(now)['ingestion_status'] == 'stalled'
+                                  last_private_raw_at=now-600,last_user_hook_at=now-120,
+                                  last_private_hook_at=now-120,private_pending_hook_count=1,
+                                  last_llm_activity_at=now)
+            assert persisted.watchdog(now)['ingestion_status'] == 'error'
             await app.terminate()
             assert app._supervisor_task.done() and app._watchdog_task.done()
 
