@@ -39,7 +39,7 @@ RECOVERY_INTERVAL_SECONDS = 30
     PLUGIN_NAME,
     "Astra & Celii",
     "星星的自动记忆库 - 私聊/群聊事件消化",
-    "0.3.1",
+    "0.3.2",
     "https://github.com/monieckbo-svg/astrbot_plugin_astra_memoir",
 )
 class AstraMemoir(Star):
@@ -105,7 +105,10 @@ class AstraMemoir(Star):
             self.db.initialize(defer_vectors=True)
             self.vec = VecStore(self.db)
             self.raw_cache = RawCache(self.db, bot_display_name=bot_display_name, health=self.health)
-            provider = EmbeddingRuntime(context, embedding_provider_id, self.db, self.health)
+            provider = EmbeddingRuntime(
+                context, embedding_provider_id, self.db, self.health,
+                max_input_chars=int(self._cfg("embedding_input_max_chars", 450)),
+            )
             self.embedding_runtime = provider
             self.extractor = EventExtractor(context, self.db, extract_provider_id)
             self.writer = EpisodeWriter(provider, self.db, self.vec)

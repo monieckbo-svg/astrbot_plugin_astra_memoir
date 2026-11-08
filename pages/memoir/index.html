@@ -502,7 +502,8 @@ async function loadStats() {
       last_private_hook_at:'最近私聊用户hook',last_group_hook_at:'最近群聊用户hook',last_raw_ingest_at:'最近原文成功入库',
       last_private_raw_at:'最近私聊原文入库',last_group_raw_at:'最近群聊原文入库',
       last_extraction_attempt_at:'最近提取尝试',last_nonempty_extraction_at:'最近有效提取（非空）',
-      last_episode_written_at:'最近episode写入（含整理合并）'};
+      last_episode_written_at:'最近episode写入（含整理合并）',
+      last_embedding_truncated_at:'最近向量输入安全裁剪'};
     const warnings = ['watchdog_warning','startup_error','raw_error','database_error','embedding_error','diagnostics_write_error']
       .filter(k => health[k]).map(k => `<div class="error">${escapeHtml(health[k])}</div>`).join('');
     document.getElementById('healthDetails').innerHTML = `<div class="card">${warnings}
@@ -510,6 +511,7 @@ async function loadStats() {
       <div class="ep-meta">私聊：${escapeHtml(statusLabel(health.private_ingestion_status || 'idle'))} · 群聊：${escapeHtml(statusLabel(health.group_ingestion_status || 'idle'))}</div>
       ${Object.entries(times).map(([k,label]) => `<div>${label}：${health[k] ? escapeHtml(new Date(health[k]*1000).toLocaleString()) : '暂无可验证记录'}</div>`).join('')}
       <div class="ep-meta">最近跳过原因：${escapeHtml(health.last_raw_skip_reason || '无')}。近期没有真实用户 hook 时显示空闲，不会仅因 raw 长时间未更新而报警。</div>
+      <div class="ep-meta">向量输入累计安全裁剪：${health.embedding_truncated_count || 0} 次；只影响送往 embedding 的副本，不修改记忆正文。</div>
       <details><summary>历史异常（最近30条，重载后保留）</summary>${(health.errors || []).slice().reverse().map(e =>
         `<div>${escapeHtml(new Date(e.at*1000).toLocaleString())} · ${escapeHtml(e.component)} · ${escapeHtml(e.message)}</div>`).join('') || '暂无'}</details></div>`;
 

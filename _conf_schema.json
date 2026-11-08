@@ -15,6 +15,12 @@
     "hint": "必须选择一个已经在 AstrBot 中配置并测试成功的 Embedding 模型。Memoir 不再自动使用第一个 provider。",
     "obvious_hint": true
   },
+  "embedding_input_max_chars": {
+    "description": "单次发送给向量模型的最大字符数",
+    "type": "int",
+    "default": 450,
+    "hint": "只裁剪生成向量用的副本，数据库中的完整记忆正文不会改变。BAAI/bge-large-zh-v1.5 建议保持 450。"
+  },
   "bot_display_name": {
     "description": "星星在记忆里的显示名（QQ 号自动通过 event.get_self_id() 获取，不需要手填）",
     "type": "string",

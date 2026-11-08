@@ -35,6 +35,17 @@ class Event:
     def get_sender_name(self): return '陆忱'
 
 
+class CapturingEmbeddingProvider(OkEmbeddingProvider):
+    def __init__(self, dim=8):
+        super().__init__(dim)
+        self.inputs = []
+    async def get_embedding(self, text):
+        self.inputs.append(text)
+        if len(text) > 450:
+            raise ValueError('provider input too long')
+        return await super().get_embedding(text)
+
+
 async def main():
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
@@ -60,12 +71,18 @@ async def main():
             assert stats['health']['private_ingestion_status'] == 'idle'
             assert stats['health']['last_nonempty_extraction_at']
 
-            ctx.embedding = OkEmbeddingProvider()
+            ctx.embedding = CapturingEmbeddingProvider()
             for _ in range(100):
                 if app.embedding_runtime.provider is ctx.embedding and app.vec.count() == 1:
                     break
                 await asyncio.sleep(0.01)
             assert app.vec.count() == 1 and not app.vec.missing_episode_ids()
+            complete_text = '开' * 700 + '关键结尾'
+            await app.embedding_runtime.get_embedding(complete_text)
+            bounded = ctx.embedding.inputs[-1]
+            assert len(bounded) <= 450 and bounded.startswith('开') and bounded.endswith('关键结尾')
+            assert '向量输入已截断' in bounded
+            assert app.health.data['embedding_truncated_count'] == 1
 
             # A hot-replaced provider is not silently used until revalidated.
             ctx.embedding = OkEmbeddingProvider()

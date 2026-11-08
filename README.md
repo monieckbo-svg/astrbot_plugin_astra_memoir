@@ -86,6 +86,7 @@ git pull
 其他可以先用默认。想调优时看：
 
 - `retrieval_max_cosine_distance`（默认 0.9）—— 相关性阈值，改小 = 更严格，改大 = 更宽松
+- `embedding_input_max_chars`（默认 450）—— 只限制送给向量模型的文本副本；完整 episode/FTS 正文不裁剪。`BAAI/bge-large-zh-v1.5` 建议保持默认值
 - `private_batch_user_turns` / `group_batch_inbound` —— 触发消化的阈值
 - `raw_retention_days`（默认 30） —— 原文保留天数
 - `nightly_maintenance_enabled` / `nightly_maintenance_hour` —— 夜间整理开关与本地小时（默认 05:00）
